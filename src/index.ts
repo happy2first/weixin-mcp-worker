@@ -37,8 +37,7 @@ function botStub(env: Env) {
 }
 
 async function callBot(env: Env, path: string, init?: RequestInit): Promise<JsonObject> {
-  const request = new Request(`https://weixin-bot.internal${path}`, init);
-  const response = await botStub(env).fetch(request);
+  const response = await botStub(env).fetch(`https://weixin-bot.internal${path}`, init as any);
   const data = await response.json().catch(() => ({
     error: "invalid_json",
     message: "Durable Object 返回了非 JSON 内容",
