@@ -12,15 +12,15 @@
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
     "agents": "0.20.1",
-    "jose": "^6.1.0",
-    "qrcode": "^1.5.4",
-    "zod": "^4.4.3"
+    "jose": "6.1.0",
+    "qrcode": "1.5.4",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260801.1",
-    "@types/node": "^26.0.1",
-    "@types/qrcode": "^1.5.5",
-    "typescript": "^6.0.3",
+    "@types/node": "26.0.1",
+    "@types/qrcode": "1.5.5",
+    "typescript": "6.0.3",
     "wrangler": "4.118.0"
   }
 }
