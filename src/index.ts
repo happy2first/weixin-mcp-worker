@@ -10,6 +10,8 @@ export { WeixinBotDO } from "./weixin-bot.js";
 const VERSION = "0.1.0";
 const PRIMARY_BOT = "primary";
 
+type JsonObject = Record<string, any>;
+
 const result = (data: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
 });
@@ -34,11 +36,14 @@ function botStub(env: Env) {
   return env.WEIXIN_BOT.get(id);
 }
 
-async function callBot(env: Env, path: string, init?: RequestInit): Promise<any> {
+async function callBot(env: Env, path: string, init?: RequestInit): Promise<JsonObject> {
   const request = new Request(`https://weixin-bot.internal${path}`, init);
   const response = await botStub(env).fetch(request);
-  const data = await response.json().catch(() => ({ error: "invalid_json", message: "Durable Object 返回了非 JSON 内容" }));
-  if (!response.ok) throw new Error(data?.message || data?.error || `Durable Object HTTP ${response.status}`);
+  const data = await response.json().catch(() => ({
+    error: "invalid_json",
+    message: "Durable Object 返回了非 JSON 内容",
+  })) as JsonObject;
+  if (!response.ok) throw new Error(data.message || data.error || `Durable Object HTTP ${response.status}`);
   return data;
 }
 
