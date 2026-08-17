@@ -47,6 +47,10 @@ function splitText(text: string, max = SEND_CHUNK_SIZE): string[] {
 }
 
 export class WeixinBotDO extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+  }
+
   private async account(): Promise<WeixinAccountState | undefined> {
     return this.ctx.storage.get<WeixinAccountState>(ACCOUNT_KEY);
   }
