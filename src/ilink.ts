@@ -33,19 +33,19 @@ function baseInfo(env: Env) {
   };
 }
 
-function commonHeaders(env: Env): HeadersInit {
+function commonHeaders(env: Env): Record<string, string> {
   return {
     "iLink-App-Id": ILINK_APP_ID,
     "iLink-App-ClientVersion": String(buildClientVersion(compatibilityVersion(env))),
   };
 }
 
-function authHeaders(env: Env, token?: string): HeadersInit {
+function authHeaders(env: Env, token?: string): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "AuthorizationType": "ilink_bot_token",
     "X-WECHAT-UIN": randomWechatUin(),
-    ...commonHeaders(env) as Record<string, string>,
+    ...commonHeaders(env),
   };
   if (token?.trim()) headers.Authorization = `Bearer ${token.trim()}`;
   return headers;
