@@ -16,7 +16,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
+      - name: Generate package lock
+        run: npm install --package-lock-only --ignore-scripts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-lock-v051
+          path: package-lock.json
+      - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
       - run: npm test
       - run: npm run check
