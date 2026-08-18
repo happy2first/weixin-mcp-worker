@@ -7,7 +7,7 @@ import { SETUP_PAGE } from "./setup-page.js";
 import type { Env } from "./types.js";
 export { WeixinBotDO } from "./weixin-bot.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const PRIMARY_BOT = "primary";
 
 type JsonObject = Record<string, any>;
@@ -55,7 +55,7 @@ function createServer(env: Env) {
   server.registerTool(
     "weixin_status",
     {
-      description: "检查微信 ClawBot 是否已绑定，以及 Worker → 微信发送通道的状态。不会返回 bot_token 等敏感凭证。",
+      description: "检查微信 ClawBot 是否已绑定、待处理微信消息数量和最近一次轮询状态。不会返回 bot_token 等敏感凭证。",
       inputSchema: {},
     },
     async () => result(await callBot(env, "/status", { method: "GET" })),
@@ -64,7 +64,7 @@ function createServer(env: Env) {
   server.registerTool(
     "weixin_send",
     {
-      description: "把文本消息发送到已绑定此 Worker 的微信本人。适合把 ChatGPT 定时任务、监测报告和摘要推送到微信。长文本会自动分段发送。",
+      description: "主动把文本消息发送到已绑定此 Worker 的微信本人。适合把 ChatGPT 定时任务、监测报告和摘要推送到微信。长文本会自动分段发送。",
       inputSchema: {
         text: z.string().min(1).max(70_000).describe("要发送到绑定微信的文本内容。"),
       },
@@ -73,6 +73,37 @@ function createServer(env: Env) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text }),
+    })),
+  );
+
+  server.registerTool(
+    "weixin_poll",
+    {
+      description: "按需向微信 iLink 拉取一次已绑定本人发给 ClawBot 的新消息，并返回尚未回复的待处理消息。适合由 ChatGPT 定时任务每小时调用；不是实时推送。返回的 messageRef 应传给 weixin_reply。",
+      inputSchema: {
+        limit: z.number().int().min(1).max(50).optional().default(20).describe("最多返回多少条待处理消息，默认 20。"),
+      },
+    },
+    async ({ limit }) => result(await callBot(env, "/poll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ limit }),
+    })),
+  );
+
+  server.registerTool(
+    "weixin_reply",
+    {
+      description: "回复 weixin_poll 返回的某条微信消息。必须使用该消息的 messageRef；Worker 会自动使用对应的 from_user_id 和 context_token。对已成功回复的 messageRef 重复调用不会重复发送。",
+      inputSchema: {
+        messageRef: z.string().min(1).max(120).describe("weixin_poll 返回的消息引用，例如 wxmsg_...。"),
+        text: z.string().min(1).max(70_000).describe("要回复到微信的文本内容。"),
+      },
+    },
+    async ({ messageRef, text }) => result(await callBot(env, "/reply", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messageRef, text }),
     })),
   );
 

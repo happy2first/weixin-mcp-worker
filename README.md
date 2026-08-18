@@ -1,67 +1,105 @@
 # weixin-mcp-worker
 
-A Cloudflare-native Remote MCP server that sends ChatGPT / MCP output to the Weixin ClawBot bound by the owner.
+Cloudflare-native Remote MCP for Weixin ClawBot.
 
-This project is designed for the first-stage, one-way path:
+Current version: **v0.2.0**.
+
+It is designed for two practical paths without a VPS or OpenClaw:
 
 ```text
+A. ChatGPT -> Weixin
+
 ChatGPT / scheduled task
         |
         | MCP: weixin_send
         v
 Cloudflare Worker
-        |
         v
 SQLite-backed Durable Object
-        |
-        | HTTPS
         v
 ilinkai.weixin.qq.com
-        |
         v
-Weixin ClawBot -> your Weixin
+Weixin ClawBot -> bound Weixin user
 ```
 
-It does **not** require a VPS, OpenClaw, Docker, or a permanently running computer.
+```text
+B. Hourly asynchronous Weixin -> ChatGPT -> Weixin
 
-> Status: v0.1.0. The initial version intentionally focuses on **ChatGPT -> Weixin**. It does not make inbound Weixin messages trigger ChatGPT.
+You reply in Weixin ClawBot
+        v
+Weixin iLink keeps the message
+        |
+        | later: ChatGPT scheduled task calls weixin_poll
+        v
+Cloudflare Worker + Durable Object
+        |
+        | stores cursor, context_token and inbound message
+        v
+ChatGPT processes the message
+        |
+        | MCP: weixin_reply(messageRef, text)
+        v
+Weixin ClawBot reply
+```
+
+This is **not real-time inbound push**. The Worker does not call or wake ChatGPT. ChatGPT must call `weixin_poll`, for example from an hourly scheduled task.
 
 ## Features
 
 - Remote MCP endpoint at `/mcp`
-- `weixin_status`: check whether a ClawBot is bound
-- `weixin_send`: send text to the Weixin user who bound this Worker
+- `weixin_status`: binding and inbound-sync status
+- `weixin_send`: proactively send text to the bound Weixin user
+- `weixin_poll`: pull one iLink update batch and return pending inbound messages
+- `weixin_reply`: reply to a specific inbound message by `messageRef`
 - Browser setup page at `/setup`
-- QR-code binding, including current iLink redirect / pairing-code states
-- Long text is split into multiple Weixin messages automatically
-- ClawBot credentials are stored in a SQLite-backed Cloudflare Durable Object, not in GitHub or Worker source
+- QR-code binding including redirect / pairing-code states
+- Long outbound text is split into multiple Weixin messages
+- Inbound `get_updates_buf` cursor is persisted in Durable Object storage
+- Inbound `context_token` is persisted and automatically used for replies
+- Pending/replied message state is persisted in Durable Object storage
+- Duplicate inbound messages are suppressed by source message identifiers
+- `weixin_reply` is idempotent for already-replied `messageRef` values
 - Cloudflare Access JWT validation for `/mcp`, `/health`, `/setup`, and setup APIs
-- The MCP tool deliberately does **not** accept an arbitrary recipient; v0.1 sends only to the Weixin user that completed the QR binding
+- Owner-only design: inbound messages from users other than the QR-bound user are ignored
+- Credentials are stored in Durable Object storage, not GitHub or Worker source
 
 ## Upstream / protocol references
 
-The Weixin iLink behavior is implemented from the currently published Tencent `Tencent/openclaw-weixin` channel implementation, while the idea of exposing the channel as MCP was inspired by `bkmashiro/weixin-mcp`.
+The iLink protocol behavior follows Tencent's current `Tencent/openclaw-weixin` implementation. The idea of exposing the channel through MCP was inspired by `bkmashiro/weixin-mcp`.
 
-- Tencent OpenClaw Weixin: https://github.com/Tencent/openclaw-weixin
-- Community weixin-mcp: https://github.com/bkmashiro/weixin-mcp
+- Tencent: `https://github.com/Tencent/openclaw-weixin`
+- Community MCP: `https://github.com/bkmashiro/weixin-mcp`
 
 This repository is an independent project and is not an official Tencent or Weixin product.
 
 ## Cloudflare resources
 
-Only these resources are required for v0.1:
+Required:
 
 1. One Cloudflare Worker
-2. One SQLite-backed Durable Object namespace, declared as `WeixinBotDO`
-3. One Durable Object binding, exposed to the Worker as `WEIXIN_BOT`
+2. One SQLite-backed Durable Object namespace exported as `WeixinBotDO`
+3. Durable Object binding `WEIXIN_BOT`
 4. Cloudflare Access in front of the Worker
 5. Optional custom domain such as `weixin.mcp.example.com`
 
-D1, KV, R2, Pages, Queues, Workflows, and Cron Triggers are not required.
+Not required:
 
-## Important: you do not manually create the Durable Object namespace
+- VPS
+- OpenClaw
+- Docker
+- D1
+- KV
+- R2
+- Pages
+- Queues
+- Cron Triggers
+- OpenAI API
 
-The repository already contains this in `wrangler.jsonc`:
+The hourly inbound check is expected to be initiated by ChatGPT Tasks through `weixin_poll`, so the Worker itself does not need a Cloudflare Cron Trigger.
+
+## Durable Object configuration
+
+`wrangler.jsonc` already declares the binding and SQLite-backed Durable Object:
 
 ```jsonc
 "durable_objects": {
@@ -80,87 +118,60 @@ The repository already contains this in `wrangler.jsonc`:
 }
 ```
 
-With current Wrangler, the first `wrangler deploy` reconciles the `exports` declaration and provisions the SQLite-backed Durable Object namespace automatically. There is no namespace ID to copy into this repository.
+With current Wrangler, the first `wrangler deploy` reconciles the export and provisions the namespace. There is no namespace ID to put in this repository.
 
-Cloudflare reference: https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
-
-## Deploy from GitHub in the Cloudflare dashboard
-
-### 1. Import the repository
-
-In Cloudflare Dashboard:
+## Deploy from GitHub in Cloudflare
 
 1. Open **Workers & Pages**.
-2. Choose **Create application** / **Import a repository** (wording may vary slightly by dashboard revision).
-3. Select this GitHub repository.
-4. Keep the Worker name as `weixin-mcp-worker`, matching `wrangler.jsonc`.
+2. Create/import an application from GitHub.
+3. Select this repository.
+4. Worker name: `weixin-mcp-worker`.
 5. Production branch: `main`.
 6. Deploy command: `npx wrangler deploy`.
-7. No separate build command is required; Wrangler bundles the TypeScript and npm dependencies.
+7. No separate build command is required.
 8. Deploy.
 
-During the first deployment, look for a Wrangler message similar to:
+After deployment verify the binding:
 
 ```text
-Durable Object exports reconciliation:
-  Created: WeixinBotDO
+Binding: WEIXIN_BOT
+Class:   WeixinBotDO
+Storage: SQLite
 ```
 
-That confirms Cloudflare provisioned the Durable Object namespace.
+## Custom domain
 
-### 2. Verify the Durable Object binding
-
-After deployment, open the Worker settings / bindings page and verify that the Worker has:
-
-```text
-Binding:    WEIXIN_BOT
-Class:      WeixinBotDO
-Storage:    SQLite
-```
-
-You may also see the namespace under Cloudflare's Durable Objects / Data Studio views. You do not need to edit the namespace manually.
-
-### 3. Add the custom domain
-
-In the Worker's **Settings -> Domains & Routes** area, add your desired custom domain, for example:
+Bind the Worker to a hostname such as:
 
 ```text
 weixin.mcp.example.com
 ```
 
-Wait until the custom domain is active before doing the QR binding.
-
-## Protect the Worker with Cloudflare Access
-
-The Worker uses Cloudflare Access JWT validation for every sensitive route.
-
-Create or reuse a Cloudflare Access self-hosted application that protects the host, for example:
+For the intended deployment this can be:
 
 ```text
-weixin.mcp.example.com/*
+weixin.mcp.happyfirst.top
 ```
 
-Then configure these Worker variables:
+## Cloudflare Access
+
+Protect the hostname with a Cloudflare Access self-hosted application.
+
+Set Worker variables:
 
 ### `TEAM_DOMAIN`
 
-Set this to the Cloudflare Access team origin only:
+Example:
 
 ```text
 https://your-team.cloudflareaccess.com
 ```
 
-Do **not** append:
-
-```text
-/cdn-cgi/access/certs
-```
-
-The Worker appends that path itself when it retrieves the Access JWKS.
+Do not append `/cdn-cgi/access/certs`; the Worker appends it.
 
 ### `POLICY_AUD`
 
-Set this to the **Application Audience (AUD) Tag** of the Access application protecting this Worker.
+Use the Access application's **Application Audience (AUD) Tag**.
 
 ### `ILINK_CLIENT_VERSION` (optional)
 
@@ -170,28 +181,21 @@ Default:
 2.4.6
 ```
 
-This is kept as a variable so it can be updated if Tencent changes the compatibility version expected by iLink without restructuring the Worker. Normally leave it unset initially.
+Leave it unset initially unless Tencent's current iLink compatibility version requires an update.
 
-The example file `.dev.vars.example` contains the same variables but no secrets.
+## Bind Weixin ClawBot
 
-## Bind your Weixin ClawBot
+After deployment, custom-domain setup, Access setup and variables:
 
-Once the Worker, custom domain, Access policy, and variables are ready:
-
-1. Open:
-
-   ```text
-   https://weixin.mcp.example.com/setup
-   ```
-
-2. Complete Cloudflare Access authentication.
+1. Open `https://weixin.mcp.example.com/setup`.
+2. Authenticate through Cloudflare Access.
 3. Click **生成新的二维码**.
-4. Scan the QR code with Weixin and confirm the ClawBot connection.
-5. If Weixin displays a numeric pairing code, enter it on the setup page.
-6. Wait until the page reports **绑定成功**.
-7. Use **发到我的微信** on the same page to run the first end-to-end send test.
+4. Scan in Weixin and confirm the ClawBot connection.
+5. Enter a numeric pairing code if Weixin requests one.
+6. Wait for **绑定成功**.
+7. Use **发到我的微信** for the first end-to-end send test.
 
-The Durable Object stores:
+Stored in Durable Object storage after binding:
 
 ```text
 bot_token
@@ -199,28 +203,33 @@ ilink_bot_id
 ilink_user_id
 baseUrl
 binding timestamp
+latest context_token (after inbound messages are polled)
+get_updates_buf cursor
+inbound pending/replied messages
 ```
 
-The setup/status API only returns masked identifiers and never exposes the stored `bot_token`.
+The MCP/status APIs never expose the raw `bot_token` or `context_token`.
 
-## Connect ChatGPT
-
-Use this Remote MCP URL:
+## MCP URL
 
 ```text
 https://weixin.mcp.example.com/mcp
 ```
 
-After the MCP connection is established, the server exposes two tools.
+## MCP tools
 
 ### `weixin_status`
 
 No arguments.
 
-Example intent:
+Returns binding status plus fields such as:
 
 ```text
-检查我的微信 MCP 是否已经绑定。
+pendingInbound
+lastPollAt
+lastPollReceived
+lastPollTimedOut
+hasContextToken
 ```
 
 ### `weixin_send`
@@ -229,103 +238,153 @@ Input:
 
 ```json
 {
-  "text": "要发送到微信的内容"
+  "text": "房地产监测结果……"
 }
 ```
 
-Example intent:
+This always sends to the Weixin user who completed QR binding. There is no arbitrary recipient parameter.
 
-```text
-把这份房地产监测结果通过微信发给我。
+### `weixin_poll`
+
+Input:
+
+```json
+{
+  "limit": 20
+}
 ```
 
-For scheduled tasks, the task can generate its report first and then call `weixin_send` with the final text.
+Behavior:
 
-## HTTP routes
+1. Reads the saved `get_updates_buf` cursor from the Durable Object.
+2. Calls `ilink/bot/getupdates` once.
+3. Stores a new cursor when returned.
+4. Accepts only direct user messages from the QR-bound user.
+5. Stores each new inbound message and its `context_token`.
+6. Returns messages whose status is still `pending`.
 
-| Route | Worker-side auth | Purpose |
-|---|---|---|
-| `/` | No JWT validation in Worker code | Basic service metadata |
-| `/health` | Cloudflare Access JWT | Worker + Weixin binding health |
-| `/setup` | Cloudflare Access JWT | Browser QR binding / send-test UI |
-| `/admin/api/*` | Cloudflare Access JWT | Setup-page backend |
-| `/mcp` | Cloudflare Access JWT | Remote MCP endpoint |
+Example response shape:
 
-If the Access application protects the whole hostname, Cloudflare can still require Access authentication before `/` reaches the Worker.
+```json
+{
+  "success": true,
+  "upstreamTimedOut": false,
+  "received": 1,
+  "ignored": 0,
+  "pending": 1,
+  "messages": [
+    {
+      "messageRef": "wxmsg_...",
+      "receivedAt": "2026-08-18T01:17:00.000Z",
+      "text": "和御景国际比较一下。",
+      "itemTypes": [1],
+      "status": "pending"
+    }
+  ]
+}
+```
+
+If no queued message is available, the Worker intentionally aborts the idle iLink long-poll after about 8 seconds and returns `upstreamTimedOut: true`. This is normal and does not advance the cursor.
+
+### `weixin_reply`
+
+Input:
+
+```json
+{
+  "messageRef": "wxmsg_...",
+  "text": "与御景国际相比……"
+}
+```
+
+The Worker looks up the stored inbound message and automatically uses its sender ID and `context_token`. After a successful reply the message is marked `replied`.
+
+Calling `weixin_reply` again with the same already-replied `messageRef` returns `alreadyReplied: true` and does not send a duplicate.
+
+## Recommended ChatGPT hourly task pattern
+
+Example task intent:
+
+```text
+Every hour, call weixin_poll. If there are pending Weixin messages, process each one using the relevant connected tools and context, then call weixin_reply with that message's messageRef and the final answer. If there are no pending messages, do nothing.
+```
+
+Example flow:
+
+```text
+09:00 ChatGPT real-estate task
+      -> weixin_send(report)
+
+09:17 You reply in Weixin ClawBot:
+      "和御景国际比较一下"
+
+10:00 Hourly ChatGPT task
+      -> weixin_poll()
+      -> receives messageRef + text
+      -> performs analysis
+      -> weixin_reply(messageRef, answer)
+
+10:00+ Weixin receives the answer
+```
+
+Expected latency is 0-60 minutes when the polling task runs hourly.
+
+## Inbound message handling
+
+v0.2 focuses on text-oriented AI workflows.
+
+Inbound normalization currently returns:
+
+- text: original text
+- voice with transcription: `[语音转文字] ...`
+- image: `[图片]`
+- file: `[文件] filename`
+- video: `[视频]`
+
+It does not yet download or decrypt inbound media.
+
+Up to 500 inbound message records are retained in the Durable Object. Pending messages are preferentially retained; old replied records are pruned first.
 
 ## Security design
 
 - No Weixin credential is committed to GitHub.
-- `bot_token` is written only to Durable Object storage after QR confirmation.
-- The MCP server does not expose the raw token.
-- `weixin_send` is bound-recipient only. A model cannot choose another Weixin user ID in v0.1.
-- The setup APIs are behind the same Access validation as MCP.
-- The project never needs your personal Weixin password.
+- `bot_token`, `context_token` and cursor stay in Durable Object storage.
+- `weixin_send` has no arbitrary recipient parameter.
+- `weixin_poll` ignores inbound users other than the QR-bound user.
+- `weixin_reply` refuses to reply to a stored message whose sender does not match the bound user.
+- `/setup`, admin APIs and MCP are protected by Cloudflare Access JWT validation.
+- Rebinding clears the old inbox and cursor so messages from a prior ClawBot binding do not leak into the new binding.
 
-Treat access to the Durable Object and the Access application as sensitive: anyone who can invoke the protected send route can cause a message to be sent from the bound ClawBot channel.
+## HTTP routes
 
-## Local development
+| Route | Auth | Purpose |
+|---|---|---|
+| `/` | no Worker JWT check | basic metadata |
+| `/health` | Cloudflare Access JWT | Worker / binding / sync health |
+| `/setup` | Cloudflare Access JWT | QR binding and send-test UI |
+| `/admin/api/*` | Cloudflare Access JWT | setup UI backend |
+| `/mcp` | Cloudflare Access JWT | Remote MCP |
 
-Copy the example variables:
-
-```bash
-cp .dev.vars.example .dev.vars
-```
-
-Install and run:
+## Local checks
 
 ```bash
 npm install
-npm run dev
-```
-
-Type-check and dry-run bundle:
-
-```bash
 npm run check
 ```
 
-Do not commit `.dev.vars`.
+`npm run check` runs TypeScript type checking and a Wrangler dry-run deployment bundle.
 
 ## Current limitations
 
-v0.1 deliberately does not implement:
-
-- Weixin -> ChatGPT push or polling
-- group chats
-- arbitrary recipients
-- images, files, voice, or video
-- contact directory
-- inbound message history
-- OpenAI API calls
-- OpenClaw
-
-These can be added later without replacing the Durable Object account store.
-
-## Troubleshooting
-
-### `/health` says `缺少 Cloudflare Access JWT`
-
-The request reached the Worker without a valid Access assertion. Check that the hostname is covered by the Access application and that the client is going through the expected Cloudflare Access / OAuth flow.
-
-### `/health` says `Expected 200 OK from the JSON Web Key Set HTTP response`
-
-Check `TEAM_DOMAIN`. It must look like:
-
-```text
-https://your-team.cloudflareaccess.com
-```
-
-not the JWKS URL itself.
-
-### QR code generates but never confirms
-
-Check Worker logs and the response from the `/admin/api/login/status` request. Current code handles node redirect and pairing-code states exposed by the Tencent implementation. If Tencent changes the iLink login state machine, compare against the latest `Tencent/openclaw-weixin` implementation.
-
-### Binding succeeds but test send fails
-
-Open `/health` and Worker logs. Confirm the saved `baseUrl` is present and the iLink API is returning an authenticated response. If the upstream begins requiring a fresh conversation context token for proactive sends, v0.1 will need to add an inbound sync step.
+- No real-time Weixin -> ChatGPT push
+- No OpenAI API bridge
+- No group chats
+- No arbitrary recipients
+- No image/file/video outbound MCP tools yet
+- No inbound media download/decryption
+- No contact directory
+- No full-text message archive beyond the bounded DO inbox
 
 ## License
 
-MIT. See `LICENSE`.
+MIT.

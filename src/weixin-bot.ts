@@ -1,18 +1,31 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   fetchLoginQr,
+  getUpdates,
   ILINK_FIXED_BASE_URL,
   normalizeIlinkBaseUrl,
   notifyStart,
   pollLoginStatus,
   sendTextMessage,
 } from "./ilink.js";
-import type { Env, LoginSessionState, WeixinAccountState } from "./types.js";
+import type {
+  Env,
+  InboundMessage,
+  LoginSessionState,
+  WeixinAccountState,
+  WeixinMessage,
+  WeixinMessageItem,
+  WeixinSyncState,
+} from "./types.js";
 
 const ACCOUNT_KEY = "account";
 const LOGIN_KEY = "login";
+const SYNC_KEY = "sync";
+const INBOX_KEY = "inbox";
 const LOGIN_TTL_MS = 5 * 60_000;
 const SEND_CHUNK_SIZE = 3500;
+const MAX_INBOX_MESSAGES = 500;
+const MAX_INBOUND_TEXT = 20_000;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
@@ -46,10 +59,84 @@ function splitText(text: string, max = SEND_CHUNK_SIZE): string[] {
   return chunks.filter(Boolean);
 }
 
-export class WeixinBotDO extends DurableObject<Env> {
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+function itemText(item: WeixinMessageItem): string {
+  switch (item.type) {
+    case 1:
+      return item.text_item?.text?.trim() || "";
+    case 2:
+      return "[图片]";
+    case 3:
+      return item.voice_item?.text?.trim()
+        ? `[语音转文字] ${item.voice_item.text.trim()}`
+        : "[语音消息]";
+    case 4:
+      return item.file_item?.file_name ? `[文件] ${item.file_item.file_name}` : "[文件]";
+    case 5:
+      return "[视频]";
+    case 11:
+      return "[工具调用开始]";
+    case 12:
+      return "[工具调用结果]";
+    default:
+      return item.type == null ? "[未知消息]" : `[消息类型 ${item.type}]`;
   }
+}
+
+function messageText(message: WeixinMessage): string {
+  const text = (message.item_list || [])
+    .map(itemText)
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  const normalized = text || "[无文本内容]";
+  return normalized.length > MAX_INBOUND_TEXT
+    ? `${normalized.slice(0, MAX_INBOUND_TEXT)}\n[内容已截断]`
+    : normalized;
+}
+
+function sourceId(message: WeixinMessage): string {
+  if (message.client_id) return `client:${message.client_id}`;
+  if (message.message_id != null) return `message:${String(message.message_id)}`;
+  const itemId = message.item_list?.find((item) => item.msg_id)?.msg_id;
+  if (itemId) return `item:${itemId}`;
+  return [
+    "fallback",
+    message.from_user_id || "",
+    String(message.create_time_ms || 0),
+    messageText(message),
+  ].join(":");
+}
+
+function publicMessage(message: InboundMessage) {
+  return {
+    messageRef: message.messageRef,
+    receivedAt: message.receivedAt,
+    text: message.text,
+    itemTypes: message.itemTypes,
+    status: message.status,
+  };
+}
+
+function pruneInbox(messages: InboundMessage[]): InboundMessage[] {
+  if (messages.length <= MAX_INBOX_MESSAGES) return messages;
+  const pending = messages.filter((message) => message.status === "pending");
+  const replied = messages.filter((message) => message.status === "replied");
+  const keepReplied = Math.max(0, MAX_INBOX_MESSAGES - pending.length);
+  return [...replied.slice(-keepReplied), ...pending].slice(-MAX_INBOX_MESSAGES);
+}
+
+type PollResult = {
+  success: true;
+  upstreamTimedOut: boolean;
+  received: number;
+  ignored: number;
+  pending: number;
+  messages: ReturnType<typeof publicMessage>[];
+  lastPollAt: string;
+};
+
+export class WeixinBotDO extends DurableObject<Env> {
+  private pollInFlight?: Promise<PollResult>;
 
   private async account(): Promise<WeixinAccountState | undefined> {
     return this.ctx.storage.get<WeixinAccountState>(ACCOUNT_KEY);
@@ -59,15 +146,34 @@ export class WeixinBotDO extends DurableObject<Env> {
     return this.ctx.storage.get<LoginSessionState>(LOGIN_KEY);
   }
 
+  private async syncState(): Promise<WeixinSyncState> {
+    return (await this.ctx.storage.get<WeixinSyncState>(SYNC_KEY)) || { getUpdatesBuf: "" };
+  }
+
+  private async inbox(): Promise<InboundMessage[]> {
+    return (await this.ctx.storage.get<InboundMessage[]>(INBOX_KEY)) || [];
+  }
+
   private async status() {
-    const account = await this.account();
-    const login = await this.login();
+    const [account, login, sync, inbox] = await Promise.all([
+      this.account(),
+      this.login(),
+      this.syncState(),
+      this.inbox(),
+    ]);
     return {
       connected: Boolean(account?.token && account?.userId),
       botId: maskId(account?.botId),
       userId: maskId(account?.userId),
       baseUrl: account?.baseUrl || null,
       boundAt: account?.boundAt || null,
+      lastInboundAt: account?.lastInboundAt || null,
+      hasContextToken: Boolean(account?.contextToken),
+      pendingInbound: inbox.filter((message) => message.status === "pending").length,
+      lastPollAt: sync.lastPollAt || null,
+      lastPollReceived: sync.lastPollReceived ?? null,
+      lastPollTimedOut: sync.lastPollTimedOut ?? null,
+      lastPollError: sync.lastPollError || null,
       lastNotifyStartAt: account?.lastNotifyStartAt || null,
       lastNotifyStartError: account?.lastNotifyStartError || null,
       login: login
@@ -128,9 +234,7 @@ export class WeixinBotDO extends DurableObject<Env> {
       return { connected: false, status: result.status, message: "已扫码，正在切换微信节点并继续验证" };
     }
 
-    if (result.status === "scaned" && login.pendingVerifyCode) {
-      login.pendingVerifyCode = undefined;
-    }
+    if (result.status === "scaned" && login.pendingVerifyCode) login.pendingVerifyCode = undefined;
 
     if (result.status === "need_verifycode") {
       await this.ctx.storage.put(LOGIN_KEY, login);
@@ -174,7 +278,7 @@ export class WeixinBotDO extends DurableObject<Env> {
         boundAt: new Date().toISOString(),
       };
       await this.ctx.storage.put(ACCOUNT_KEY, account);
-      await this.ctx.storage.delete(LOGIN_KEY);
+      await this.ctx.storage.delete([LOGIN_KEY, SYNC_KEY, INBOX_KEY]);
 
       try {
         await notifyStart(this.env, account.baseUrl, account.token);
@@ -218,13 +322,192 @@ export class WeixinBotDO extends DurableObject<Env> {
         token: account.token,
         toUserId: account.userId,
         text: chunk,
+        contextToken: account.contextToken,
       }));
     }
     return {
       success: true,
       recipient: maskId(account.userId),
+      usedContextToken: Boolean(account.contextToken),
       chunks: chunks.length,
       messageIds,
+    };
+  }
+
+  private async performPoll(limit: number): Promise<PollResult> {
+    const account = await this.account();
+    if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先打开 /setup 完成扫码绑定");
+
+    const sync = await this.syncState();
+    let inbox = await this.inbox();
+    const now = new Date().toISOString();
+
+    try {
+      const response = await getUpdates(this.env, {
+        baseUrl: account.baseUrl,
+        token: account.token,
+        getUpdatesBuf: sync.getUpdatesBuf,
+      });
+
+      if (response.timedOut) {
+        sync.lastPollAt = now;
+        sync.lastPollTimedOut = true;
+        sync.lastPollReceived = 0;
+        sync.lastPollIgnored = 0;
+        sync.lastPollError = undefined;
+        await this.ctx.storage.put(SYNC_KEY, sync);
+      } else {
+        const isApiError =
+          (response.ret !== undefined && response.ret !== 0) ||
+          (response.errcode !== undefined && response.errcode !== 0);
+        if (isApiError) {
+          throw new Error(`微信 getUpdates 失败：ret=${response.ret ?? 0}, errcode=${response.errcode ?? 0}, errmsg=${response.errmsg || "unknown"}`);
+        }
+
+        let received = 0;
+        let ignored = 0;
+        const known = new Set(inbox.map((message) => message.sourceId));
+
+        for (const message of response.msgs || []) {
+          // This Worker is intentionally owner-only. Ignore bot echoes and any sender
+          // other than the Weixin user that performed the QR binding.
+          if (message.message_type !== undefined && message.message_type !== 1) {
+            ignored += 1;
+            continue;
+          }
+          if (!message.from_user_id || message.from_user_id !== account.userId) {
+            ignored += 1;
+            continue;
+          }
+
+          const id = sourceId(message);
+          if (known.has(id)) continue;
+          known.add(id);
+
+          const inbound: InboundMessage = {
+            messageRef: `wxmsg_${crypto.randomUUID().replace(/-/g, "")}`,
+            sourceId: id,
+            fromUserId: message.from_user_id,
+            contextToken: message.context_token,
+            text: messageText(message),
+            itemTypes: (message.item_list || []).map((item) => item.type).filter((type): type is number => typeof type === "number"),
+            receivedAt: message.create_time_ms
+              ? new Date(message.create_time_ms).toISOString()
+              : now,
+            createTimeMs: message.create_time_ms,
+            status: "pending",
+          };
+          inbox.push(inbound);
+          received += 1;
+
+          if (message.context_token) account.contextToken = message.context_token;
+          account.lastInboundAt = now;
+        }
+
+        inbox = pruneInbox(inbox);
+        if (response.get_updates_buf) sync.getUpdatesBuf = response.get_updates_buf;
+        sync.lastPollAt = now;
+        sync.lastPollTimedOut = false;
+        sync.lastPollReceived = received;
+        sync.lastPollIgnored = ignored;
+        sync.lastPollError = undefined;
+
+        await this.ctx.storage.put({
+          [ACCOUNT_KEY]: account,
+          [SYNC_KEY]: sync,
+          [INBOX_KEY]: inbox,
+        });
+      }
+    } catch (error) {
+      sync.lastPollAt = now;
+      sync.lastPollError = errorMessage(error);
+      await this.ctx.storage.put(SYNC_KEY, sync);
+      throw error;
+    }
+
+    const pending = inbox.filter((message) => message.status === "pending");
+    return {
+      success: true,
+      upstreamTimedOut: Boolean(sync.lastPollTimedOut),
+      received: sync.lastPollReceived || 0,
+      ignored: sync.lastPollIgnored || 0,
+      pending: pending.length,
+      messages: pending.slice(0, limit).map(publicMessage),
+      lastPollAt: sync.lastPollAt || now,
+    };
+  }
+
+  private async poll(limit: number): Promise<PollResult> {
+    if (!this.pollInFlight) {
+      this.pollInFlight = this.performPoll(limit).finally(() => {
+        this.pollInFlight = undefined;
+      });
+    }
+    return this.pollInFlight;
+  }
+
+  private async reply(messageRef: string, text: string) {
+    const account = await this.account();
+    if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先打开 /setup 完成扫码绑定");
+
+    const chunks = splitText(text);
+    if (!chunks.length) throw new Error("回复内容不能为空");
+    if (chunks.length > 20) throw new Error("回复过长；单次最多发送约 7 万字符");
+
+    const inbox = await this.inbox();
+    const index = inbox.findIndex((message) => message.messageRef === messageRef);
+    if (index < 0) throw new Error("找不到 messageRef；请先调用 weixin_poll 获取待处理消息");
+    const message = inbox[index];
+
+    if (message.status === "replied") {
+      return {
+        success: true,
+        alreadyReplied: true,
+        messageRef,
+        repliedAt: message.repliedAt,
+        messageIds: message.replyMessageIds || [],
+      };
+    }
+
+    if (message.fromUserId !== account.userId) throw new Error("该消息不是来自当前绑定微信用户，拒绝回复");
+
+    const messageIds: string[] = [];
+    try {
+      for (const chunk of chunks) {
+        messageIds.push(await sendTextMessage(this.env, {
+          baseUrl: account.baseUrl,
+          token: account.token,
+          toUserId: message.fromUserId,
+          text: chunk,
+          contextToken: message.contextToken || account.contextToken,
+        }));
+      }
+    } catch (error) {
+      message.lastReplyError = errorMessage(error);
+      inbox[index] = message;
+      await this.ctx.storage.put(INBOX_KEY, inbox);
+      throw error;
+    }
+
+    message.status = "replied";
+    message.repliedAt = new Date().toISOString();
+    message.replyMessageIds = messageIds;
+    message.lastReplyError = undefined;
+    inbox[index] = message;
+    if (message.contextToken) account.contextToken = message.contextToken;
+
+    await this.ctx.storage.put({
+      [ACCOUNT_KEY]: account,
+      [INBOX_KEY]: inbox,
+    });
+
+    return {
+      success: true,
+      alreadyReplied: false,
+      messageRef,
+      chunks: chunks.length,
+      messageIds,
+      repliedAt: message.repliedAt,
     };
   }
 
@@ -244,8 +527,17 @@ export class WeixinBotDO extends DurableObject<Env> {
         return json(await this.pollLogin(sessionId, typeof body.verifyCode === "string" ? body.verifyCode : undefined));
       }
       if (url.pathname === "/send") {
-        const text = String(body.text || "");
-        return json(await this.send(text));
+        return json(await this.send(String(body.text || "")));
+      }
+      if (url.pathname === "/poll") {
+        const requested = Number(body.limit || 20);
+        const limit = Number.isFinite(requested) ? Math.min(50, Math.max(1, Math.trunc(requested))) : 20;
+        return json(await this.poll(limit));
+      }
+      if (url.pathname === "/reply") {
+        const messageRef = String(body.messageRef || "").trim();
+        if (!messageRef) throw new Error("缺少 messageRef");
+        return json(await this.reply(messageRef, String(body.text || "")));
       }
       return json({ error: "not_found" }, 404);
     } catch (error) {

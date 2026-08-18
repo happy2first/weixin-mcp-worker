@@ -1,9 +1,15 @@
-import type { Env, LoginPollResponse, LoginQrResponse } from "./types.js";
+import type {
+  Env,
+  GetUpdatesResponse,
+  LoginPollResponse,
+  LoginQrResponse,
+} from "./types.js";
 
 export const ILINK_FIXED_BASE_URL = "https://ilinkai.weixin.qq.com";
 const ILINK_APP_ID = "bot";
 const DEFAULT_COMPAT_VERSION = "2.4.6";
-const BOT_AGENT = "weixin-mcp-worker/0.1.0";
+const BOT_AGENT = "weixin-mcp-worker/0.2.0";
+const INBOUND_POLL_TIMEOUT_MS = 8_000;
 
 function normalizeBaseUrl(value?: string): string {
   const raw = String(value || ILINK_FIXED_BASE_URL).trim().replace(/\/$/, "");
@@ -43,7 +49,7 @@ function commonHeaders(env: Env): Record<string, string> {
 function authHeaders(env: Env, token?: string): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    "AuthorizationType": "ilink_bot_token",
+    AuthorizationType: "ilink_bot_token",
     "X-WECHAT-UIN": randomWechatUin(),
     ...commonHeaders(env),
   };
@@ -101,6 +107,10 @@ async function getJson<T>(
   return JSON.parse(text) as T;
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
 export async function fetchLoginQr(env: Env, localTokenList: string[] = []): Promise<LoginQrResponse> {
   return postJson<LoginQrResponse>(
     env,
@@ -123,7 +133,7 @@ export async function pollLoginStatus(
   try {
     return await getJson<LoginPollResponse>(env, baseUrl, endpoint, 35_000);
   } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") return { status: "wait" };
+    if (isAbortError(error)) return { status: "wait" };
     throw error;
   }
 }
@@ -137,6 +147,38 @@ export async function notifyStart(env: Env, baseUrl: string, token: string): Pro
     token,
     10_000,
   );
+}
+
+/**
+ * Pull one iLink update batch. This is intentionally not a permanent monitor:
+ * ChatGPT can call it from a scheduled task (for example once per hour).
+ * When there are no queued messages, the Worker aborts the idle long-poll after
+ * a short timeout and reports timedOut=true without advancing the cursor.
+ */
+export async function getUpdates(
+  env: Env,
+  params: {
+    baseUrl: string;
+    token: string;
+    getUpdatesBuf?: string;
+  },
+): Promise<GetUpdatesResponse> {
+  try {
+    return await postJson<GetUpdatesResponse>(
+      env,
+      params.baseUrl,
+      "ilink/bot/getupdates",
+      {
+        get_updates_buf: params.getUpdatesBuf || "",
+        base_info: baseInfo(env),
+      },
+      params.token,
+      INBOUND_POLL_TIMEOUT_MS,
+    );
+  } catch (error) {
+    if (isAbortError(error)) return { timedOut: true };
+    throw error;
+  }
 }
 
 export async function sendTextMessage(
