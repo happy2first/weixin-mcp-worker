@@ -23,9 +23,9 @@ jobs:
           from pathlib import Path
           p=Path('src/admin-page.ts')
           s=p.read_text()
-          # Dynamic onclick JavaScript needs a literal backslash to survive the outer TypeScript template.
-          s=s.replace("\\''", "\\\\''")
-          # Newline escapes inside the generated browser script need the same extra template-escape layer.
+          # Every backslash-quote inside generated inline JS needs one extra backslash to survive the outer TS template.
+          s=s.replace("\\'", "\\\\'")
+          # Browser JS newline escapes need the same extra template-escape layer.
           start=s.index('async function testPoll')
           end=s.index('\nfunction openMedia',start)
           segment=s[start:end].replace('\\n','\\\\n')
