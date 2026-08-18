@@ -371,14 +371,33 @@ export default {
     if (!allowed) return new Response("Not Found", { status: 404 });
     let identity;
     try { identity = await verifyAccess(request, env); } catch (error) { return accessDenied(error); }
-    if (url.pathname === "/admin") return new Response(ADMIN_PAGE, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" } });
+    if (url.pathname === "/admin") return new Response(ADMIN_PAGE, { headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "x-robots-tag": "noindex, nofollow",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+    } });
     if (url.pathname.startsWith("/admin/media/")) {
       try { return await handleAdminMedia(env, url.pathname); }
       catch (error) { return Response.json({ error: "media_error", message: error instanceof Error ? error.message : String(error) }, { status: 400 }); }
     }
     if (url.pathname.startsWith("/admin/api/")) {
-      try { return await handleAdmin(request, env, url.pathname); }
-      catch (error) { return Response.json({ error: "admin_error", message: error instanceof Error ? error.message : String(error) }, { status: 400 }); }
+      if (request.method !== "GET") {
+        const contentType = (request.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
+        if (contentType !== "application/json") return Response.json({ error: "unsupported_media_type", message: "管理 API 仅接受 application/json" }, { status: 415 });
+        const origin = request.headers.get("origin");
+        if (origin && origin !== url.origin) return Response.json({ error: "cross_origin_denied", message: "拒绝跨站管理请求" }, { status: 403 });
+      }
+      try {
+        const response = await handleAdmin(request, env, url.pathname);
+        const headers = new Headers(response.headers);
+        headers.set("cache-control", "no-store");
+        headers.set("x-content-type-options", "nosniff");
+        return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+      }
+      catch (error) { return Response.json({ error: "admin_error", message: error instanceof Error ? error.message : String(error) }, { status: 400, headers: { "cache-control": "no-store" } }); }
     }
     if (url.pathname === "/health") {
       try { return Response.json({ ok: true, service: "weixin-mcp-worker", version: VERSION, user: identity.email || identity.sub || "authenticated", weixin: await usersWithStatus(env) }); }
