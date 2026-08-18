@@ -4,7 +4,7 @@ import { writeFileSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { ADMIN_PAGE } from "../src/admin-page.ts";
 
-// Compile the exact browser script emitted by the ADMIN_PAGE template.
+// Compile the exact browser script emitted by the ADMIN_PAGE template on every CI run.
 test("admin inline script parses as valid JavaScript", () => {
   const match = ADMIN_PAGE.match(/<script>([\s\S]*?)<\/script>/i);
   assert.ok(match, "ADMIN_PAGE must contain an inline script");
