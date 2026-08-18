@@ -17,3 +17,5 @@ test("admin inline script parses as valid JavaScript", () => {
     unlinkSync(path);
   }
 });
+
+// Kept intentionally small: runtime action behavior is covered by browser-script syntax plus server API tests.
