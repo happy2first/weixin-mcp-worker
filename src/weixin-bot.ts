@@ -121,8 +121,9 @@ function pruneInbox(messages: InboundMessage[]): InboundMessage[] {
   if (messages.length <= MAX_INBOX_MESSAGES) return messages;
   const pending = messages.filter((message) => message.status === "pending");
   const replied = messages.filter((message) => message.status === "replied");
-  const keepReplied = Math.max(0, MAX_INBOX_MESSAGES - pending.length);
-  return [...replied.slice(-keepReplied), ...pending].slice(-MAX_INBOX_MESSAGES);
+  if (pending.length >= MAX_INBOX_MESSAGES) return pending.slice(-MAX_INBOX_MESSAGES);
+  const keepReplied = MAX_INBOX_MESSAGES - pending.length;
+  return [...replied.slice(-keepReplied), ...pending];
 }
 
 type PollResult = {
@@ -369,8 +370,8 @@ export class WeixinBotDO extends DurableObject<Env> {
         const known = new Set(inbox.map((message) => message.sourceId));
 
         for (const message of response.msgs || []) {
-          // This Worker is intentionally owner-only. Ignore bot echoes and any sender
-          // other than the Weixin user that performed the QR binding.
+          // Owner-only by design: ignore bot echoes and any sender other than the
+          // Weixin user that performed the QR binding.
           if (message.message_type !== undefined && message.message_type !== 1) {
             ignored += 1;
             continue;
@@ -384,6 +385,9 @@ export class WeixinBotDO extends DurableObject<Env> {
           if (known.has(id)) continue;
           known.add(id);
 
+          const createTimeMs = typeof message.create_time_ms === "number" && Number.isFinite(message.create_time_ms)
+            ? message.create_time_ms
+            : undefined;
           const inbound: InboundMessage = {
             messageRef: `wxmsg_${crypto.randomUUID().replace(/-/g, "")}`,
             sourceId: id,
@@ -391,10 +395,8 @@ export class WeixinBotDO extends DurableObject<Env> {
             contextToken: message.context_token,
             text: messageText(message),
             itemTypes: (message.item_list || []).map((item) => item.type).filter((type): type is number => typeof type === "number"),
-            receivedAt: message.create_time_ms
-              ? new Date(message.create_time_ms).toISOString()
-              : now,
-            createTimeMs: message.create_time_ms,
+            receivedAt: createTimeMs ? new Date(createTimeMs).toISOString() : now,
+            createTimeMs,
             status: "pending",
           };
           inbox.push(inbound);
