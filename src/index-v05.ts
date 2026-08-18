@@ -2,6 +2,8 @@ import baseWorker from "./index.js";
 import type { Env } from "./types.js";
 export { WeixinBotDO } from "./weixin-bot-v05.js";
 
+const VERSION = "0.5.0";
+
 function normalizeProfileId(value: unknown): string {
   const id = String(value || "").trim().toLowerCase();
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(id)) throw new Error(`无效微信用户标识：${id || "(空)"}`);
@@ -12,9 +14,9 @@ function userStub(env: Env, userId: string) {
   return env.WEIXIN_BOT.get(env.WEIXIN_BOT.idFromName(`user:${normalizeProfileId(userId)}`));
 }
 
-async function adaptDoResponse(response: Awaited<ReturnType<ReturnType<typeof userStub>["fetch"]>>): Promise<Response> {
+async function adaptDoResponse(response: any): Promise<Response> {
   const headers = new Headers();
-  response.headers.forEach((value, key) => headers.set(key, value));
+  response.headers.forEach((value: string, key: string) => headers.set(key, value));
   const body = await response.arrayBuffer();
   return new Response(body, { status: response.status, statusText: response.statusText, headers });
 }
@@ -54,10 +56,17 @@ async function handleRetentionAdmin(request: Request, env: Env, ctx: ExecutionCo
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ limitMB: body.limitMB }),
     } as any);
-    return adaptDoResponse(upstream as any);
+    return adaptDoResponse(upstream);
   } catch (error) {
     return Response.json({ error: "retention_admin_error", message: error instanceof Error ? error.message : String(error) }, { status: 400 });
   }
+}
+
+function adaptJsonVersion(response: Response, data: Record<string, unknown>): Response {
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.set("content-type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify({ ...data, version: VERSION }), { status: response.status, statusText: response.statusText, headers });
 }
 
 export default {
@@ -77,6 +86,10 @@ export default {
       const headers = new Headers(response.headers);
       headers.delete("content-length");
       return new Response(html, { status: response.status, statusText: response.statusText, headers });
+    }
+    if ((url.pathname === "/" || url.pathname === "/health") && response.headers.get("content-type")?.includes("application/json")) {
+      const data = await response.json().catch(() => null) as Record<string, unknown> | null;
+      if (data) return adaptJsonVersion(response, data);
     }
     return response;
   },
