@@ -14,7 +14,8 @@ export const SETUP_PAGE = `<!doctype html>
     p { line-height: 1.55; }
     button { border: 0; border-radius: 10px; padding: 11px 15px; margin: 4px 8px 4px 0; font-size: 15px; cursor: pointer; background: #111; color: white; }
     button.secondary { background: #e9eaed; color: #111; }
-    input { width: 100%; box-sizing: border-box; padding: 11px; border: 1px solid #d7d9dd; border-radius: 9px; font-size: 16px; margin: 6px 0 10px; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 11px; border: 1px solid #d7d9dd; border-radius: 9px; font-size: 16px; margin: 6px 0 10px; font-family: inherit; }
+    textarea { min-height: 92px; resize: vertical; }
     pre { white-space: pre-wrap; word-break: break-word; background: #f2f3f5; border-radius: 10px; padding: 12px; font-size: 13px; }
     #qr svg { width: min(78vw, 320px); height: auto; background: white; padding: 10px; border-radius: 10px; }
     .ok { color: #15803d; font-weight: 600; }
@@ -23,7 +24,7 @@ export const SETUP_PAGE = `<!doctype html>
     @media (prefers-color-scheme: dark) {
       body { background: #111318; color: #f3f4f6; }
       .card { background: #1b1e24; }
-      input { background: #111318; border-color: #3b3f46; color: white; }
+      input, textarea { background: #111318; border-color: #3b3f46; color: white; }
       pre { background: #111318; }
       button.secondary { background: #353941; color: white; }
       .muted { color: #aeb3bd; }
@@ -33,7 +34,7 @@ export const SETUP_PAGE = `<!doctype html>
 <body>
 <main>
   <h1>微信 ClawBot MCP</h1>
-  <p class="muted">用于把 ChatGPT / MCP 的消息推送到绑定微信。扫码凭证只保存在 Cloudflare Durable Object 中。</p>
+  <p class="muted">v0.2：支持 ChatGPT → 微信主动发送，以及由 ChatGPT 定时调用 weixin_poll 实现的小时级异步收取/回复。凭证、cursor 和 context_token 只保存在 Cloudflare Durable Object 中。</p>
 
   <section class="card">
     <h2>1. 当前状态</h2>
@@ -55,10 +56,23 @@ export const SETUP_PAGE = `<!doctype html>
   </section>
 
   <section class="card">
-    <h2>3. 测试发送</h2>
+    <h2>3. 测试主动发送</h2>
     <input id="testText" value="weixin-mcp-worker 测试消息：如果你看到这条消息，说明 Worker → 微信链路已经打通。" />
     <button onclick="testSend()">发到我的微信</button>
     <pre id="sendResult">尚未测试</pre>
+  </section>
+
+  <section class="card">
+    <h2>4. 测试收取与回复</h2>
+    <p class="muted">先在微信 ClawBot 中回复一条消息，然后点“拉取微信回复”。这相当于以后 ChatGPT 每小时调用一次 weixin_poll。</p>
+    <button onclick="pollInbound()">拉取微信回复</button>
+    <pre id="pollResult">尚未拉取</pre>
+    <label>messageRef</label>
+    <input id="replyRef" placeholder="拉取成功后会自动填入第一条待处理消息的 messageRef" />
+    <label>测试回复内容</label>
+    <textarea id="replyText">这是 weixin_reply 的测试回复。如果你在微信看到这条消息，说明 微信 → Worker → 回复微信 的链路已经打通。</textarea>
+    <button onclick="replyInbound()">回复这条微信</button>
+    <pre id="replyResult">尚未回复</pre>
   </section>
 </main>
 <script>
@@ -139,7 +153,31 @@ async function testSend() {
     show('sendResult', '发送中...');
     const text = document.getElementById('testText').value;
     show('sendResult', await api('/send', { text }));
+    await refreshStatus();
   } catch (e) { show('sendResult', '错误：' + e.message); }
+}
+
+async function pollInbound() {
+  try {
+    show('pollResult', '拉取中；如果当前没有排队消息，可能等待约 8 秒...');
+    const data = await api('/poll', { limit: 20 });
+    show('pollResult', data);
+    if (data.messages && data.messages.length && data.messages[0].messageRef) {
+      document.getElementById('replyRef').value = data.messages[0].messageRef;
+    }
+    await refreshStatus();
+  } catch (e) { show('pollResult', '错误：' + e.message); }
+}
+
+async function replyInbound() {
+  try {
+    const messageRef = document.getElementById('replyRef').value.trim();
+    const text = document.getElementById('replyText').value;
+    if (!messageRef) throw new Error('请先拉取消息并填写 messageRef');
+    show('replyResult', '回复中...');
+    show('replyResult', await api('/reply', { messageRef, text }));
+    await refreshStatus();
+  } catch (e) { show('replyResult', '错误：' + e.message); }
 }
 
 refreshStatus();

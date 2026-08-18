@@ -159,6 +159,25 @@ async function handleAdmin(request: Request, env: Env, pathname: string): Promis
     }));
   }
 
+  if (pathname === "/admin/api/poll") {
+    return Response.json(await callBot(env, "/poll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ limit: body.limit || 20 }),
+    }));
+  }
+
+  if (pathname === "/admin/api/reply") {
+    return Response.json(await callBot(env, "/reply", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messageRef: body.messageRef,
+        text: body.text,
+      }),
+    }));
+  }
+
   return Response.json({ error: "not_found" }, { status: 404 });
 }
 
