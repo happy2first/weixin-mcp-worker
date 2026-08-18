@@ -6,62 +6,17 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: prelaunch-hardening
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Apply prelaunch reliability fixes
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          # 1) A successful Weixin reply must not be reported as transport failure
-          # merely because local history persistence fails afterwards.
-          p = Path('src/bot.ts')
-          s = p.read_text()
-          start = s.index('  private async reply(messageRef: string,text: string) {')
-          end = s.index('  private listMessages(', start)
-          replacement = '''  private async reply(messageRef: string,text: string) {\n    const account=await this.account();\n    if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先在 /admin 完成扫码绑定");\n    this.ensureSchema();\n    const row=this.ctx.storage.sql.exec<MessageRow>("SELECT * FROM messages WHERE message_ref=? LIMIT 1",messageRef).toArray()[0];\n    if (!row || row.direction !== "inbound") throw new Error("找不到 messageRef；请先调用 weixin_poll 获取待处理消息");\n    if (row.status === "replied") return { success:true,alreadyReplied:true,messageRef,repliedAt:row.replied_at };\n    if (row.from_user_id !== account.userId) throw new Error("该消息不是来自当前绑定微信用户，拒绝回复");\n    const chunks=splitText(text);\n    if (!chunks.length) throw new Error("回复内容不能为空");\n    if (chunks.length > MAX_SEND_CHUNKS) throw new Error("回复过长；单次最多发送约 7 万字符");\n    const outboundRef=`out_${crypto.randomUUID().replace(/-/g,"")}`;\n    const messageIds:string[]=[];\n    let replyContext=row.context_token || account.contextToken;\n    await this.safeEnforceRetention();\n    try {\n      for (let i=0;i<chunks.length;i+=1) {\n        const sent=await this.sendTextWithRecovery(account,row.from_user_id,chunks[i],replyContext);\n        messageIds.push(sent.value);replyContext=sent.contextToken;\n        if (i < chunks.length - 1) await sleep(SEND_CHUNK_DELAY_MS);\n      }\n    } catch (error) {\n      try { this.ctx.storage.sql.exec("UPDATE messages SET error=? WHERE message_ref=?",errorMessage(error),messageRef); } catch {}\n      try { this.insertHistory({ message_ref:outboundRef,source_id:null,direction:"outbound",kind:"text",text,status:"failed",context_token:null,from_user_id:null,created_at:new Date().toISOString(),replied_at:null,reply_to:messageRef,metadata_json:JSON.stringify({ chunks:chunks.length }),external_ids_json:JSON.stringify(messageIds),error:errorMessage(error) }); } catch (historyError) { await this.alertStorageFull(historyError); }\n      await this.safeEnforceRetention();\n      throw error;\n    }\n\n    const repliedAt=new Date().toISOString();\n    let stateWarning:string | null=null;\n    try {\n      this.ctx.storage.sql.exec("UPDATE messages SET status='replied',replied_at=?,error=NULL WHERE message_ref=?",repliedAt,messageRef);\n    } catch (firstStateError) {\n      await this.safeEnforceRetention();\n      try {\n        this.ctx.storage.sql.exec("UPDATE messages SET status='replied',replied_at=?,error=NULL WHERE message_ref=?",repliedAt,messageRef);\n      } catch (retryStateError) {\n        stateWarning=errorMessage(retryStateError);\n        await this.alertStorageFull(retryStateError);\n      }\n    }\n    const historyWarning=await this.persistDeliveredHistory({ message_ref:outboundRef,source_id:null,direction:"outbound",kind:"text",text,status:"sent",context_token:null,from_user_id:null,created_at:repliedAt,replied_at:null,reply_to:messageRef,metadata_json:JSON.stringify({ chunks:chunks.length }),external_ids_json:JSON.stringify(messageIds),error:null });\n    if (replyContext) account.contextToken=replyContext; else delete account.contextToken;\n    try { await this.ctx.storage.put(ACCOUNT_KEY,account); } catch (accountError) { stateWarning=stateWarning || errorMessage(accountError); }\n    const cleanup=await this.safeEnforceRetention();\n    return { success:true,alreadyReplied:false,messageRef,outboundMessageRef:outboundRef,chunks:chunks.length,messageIds,repliedAt,historyWarning,stateWarning,cleanup };\n  }\n\n'''
-          s = s[:start] + replacement + s[end:]
-          p.write_text(s)
-
-          # 2) Enforce the 20 MiB inbound-media cap while streaming, even when
-          # the CDN omits Content-Length. Also impose a hard download timeout.
-          p = Path('src/media-v051.ts')
-          s = p.read_text()
-          start = s.index('async function fetchBounded(url: string): Promise<Uint8Array> {')
-          end = s.index('async function downloadMedia(', start)
-          replacement = '''async function fetchBounded(url: string): Promise<Uint8Array> {\n  const controller = new AbortController();\n  const timer = setTimeout(() => controller.abort(), 30_000);\n  try {\n    const response = await fetch(normalizeHttpsUrl(url), { signal: controller.signal });\n    if (!response.ok) throw new Error(`微信 CDN 下载失败：HTTP ${response.status}`);\n    const declared = Number(response.headers.get("content-length") || "0");\n    if (declared > MAX_MEDIA_BYTES) throw new Error(`媒体文件过大：${declared} bytes，当前上限 ${MAX_MEDIA_BYTES} bytes`);\n    if (!response.body) return new Uint8Array();\n    const reader = response.body.getReader();\n    const output = new Uint8Array(MAX_MEDIA_BYTES);\n    let offset = 0;\n    try {\n      while (true) {\n        const { done, value } = await reader.read();\n        if (done) break;\n        if (!value) continue;\n        if (offset + value.byteLength > MAX_MEDIA_BYTES) {\n          await reader.cancel("media too large").catch(() => undefined);\n          throw new Error(`媒体文件过大：超过当前 ${MAX_MEDIA_BYTES} bytes 上限`);\n        }\n        output.set(value, offset);\n        offset += value.byteLength;\n      }\n    } finally {\n      reader.releaseLock();\n    }\n    return output.subarray(0, offset);\n  } finally {\n    clearTimeout(timer);\n  }\n}\n\n'''
-          s = s[:start] + replacement + s[end:]
-          p.write_text(s)
-
-          # 3) Bound outbound CDN upload time as well.
-          p = Path('src/protocol.ts')
-          s = p.read_text()
-          old = '''  const ciphertext = encryptAesEcb(params.bytes, aesKey);\n  const response = await fetch(target, {\n    method: "POST",\n    headers: { "Content-Type": "application/octet-stream" },\n    body: ciphertext.slice().buffer as ArrayBuffer,\n  });\n  if (!response.ok) {\n    const detail = response.headers.get("x-error-message") || await response.text().catch(() => "");\n    throw new Error(`微信 CDN 上传失败：HTTP ${response.status}${detail ? ` ${detail.slice(0, 300)}` : ""}`);\n  }\n  const downloadEncryptedQueryParam = response.headers.get("x-encrypted-param") || "";'''
-          new = '''  const ciphertext = encryptAesEcb(params.bytes, aesKey);\n  const controller = new AbortController();\n  const timer = setTimeout(() => controller.abort(), 30_000);\n  let response: Response;\n  try {\n    response = await fetch(target, {\n      method: "POST",\n      headers: { "Content-Type": "application/octet-stream" },\n      body: ciphertext.slice().buffer as ArrayBuffer,\n      signal: controller.signal,\n    });\n  } finally {\n    clearTimeout(timer);\n  }\n  if (!response.ok) {\n    const detail = response.headers.get("x-error-message") || await response.text().catch(() => "");\n    throw new Error(`微信 CDN 上传失败：HTTP ${response.status}${detail ? ` ${detail.slice(0, 300)}` : ""}`);\n  }\n  const downloadEncryptedQueryParam = response.headers.get("x-encrypted-param") || "";'''
-          if old not in s:
-              raise SystemExit('protocol upload patch target not found')
-          s = s.replace(old, new)
-          p.write_text(s)
-          PY
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
       - run: npm test
       - run: npm run check
-      - name: Commit validated prelaunch fixes
-        if: github.event_name == 'pull_request'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/bot.ts src/media-v051.ts src/protocol.ts
-          git diff --cached --quiet || git commit -m "Harden reply persistence and media streaming"
-          git push origin HEAD:prelaunch-hardening
