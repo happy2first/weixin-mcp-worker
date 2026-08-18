@@ -61,7 +61,15 @@ function callUser(env: Env, userId: string, path: string, init?: RequestInit) {
 }
 
 async function callUserRaw(env: Env, userId: string, path: string, init?: RequestInit): Promise<Response> {
-  return userStub(env, userId).fetch(`https://weixin-bot.internal${path}`, init as any);
+  const upstream = await userStub(env, userId).fetch(`https://weixin-bot.internal${path}`, init as any);
+  const headers = new Headers();
+  upstream.headers.forEach((value, key) => headers.set(key, value));
+  const body = await upstream.arrayBuffer();
+  return new Response(body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
 }
 
 async function profiles(env: Env): Promise<WeixinUserProfile[]> {
