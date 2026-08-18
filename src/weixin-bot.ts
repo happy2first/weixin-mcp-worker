@@ -27,6 +27,7 @@ const REGISTRY_KEY = "registry.users";
 const LOGIN_TTL_MS = 5 * 60_000;
 const SEND_CHUNK_SIZE = 3500;
 const MAX_INBOUND_TEXT = 20_000;
+const STORAGE_ALERT_COOLDOWN_MS = 6 * 60 * 60_000;
 
 type MessageRow = {
   message_ref: string;
@@ -61,6 +62,10 @@ function json(data: unknown, status = 200): Response {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isStorageFullError(error: unknown): boolean {
+  return /SQLITE_FULL|database or disk is full/i.test(errorMessage(error));
 }
 
 function maskId(value?: string): string | null {
@@ -199,6 +204,7 @@ function normalizeProfileId(value: unknown): string {
 
 export class WeixinBotDO extends DurableObject<Env> {
   private pollInFlight?: Promise<PollResult>;
+  private lastStorageAlertAt = 0;
 
   private ensureSchema() {
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS messages (
@@ -223,6 +229,26 @@ export class WeixinBotDO extends DurableObject<Env> {
 
   private async account(): Promise<WeixinAccountState | undefined> {
     return this.ctx.storage.get<WeixinAccountState>(ACCOUNT_KEY);
+  }
+
+  private async alertStorageFull(error: unknown): Promise<void> {
+    if (!isStorageFullError(error)) return;
+    const now = Date.now();
+    if (now - this.lastStorageAlertAt < STORAGE_ALERT_COOLDOWN_MS) return;
+    this.lastStorageAlertAt = now;
+    try {
+      const account = await this.account();
+      if (!account?.token || !account.userId) return;
+      await sendTextMessage(this.env, {
+        baseUrl: account.baseUrl,
+        token: account.token,
+        toUserId: account.userId,
+        contextToken: account.contextToken,
+        text: "微信 MCP 存储空间已满，新的历史记录或媒体文件可能无法保存。请打开 /admin 删除不需要的消息或媒体后再试。",
+      });
+    } catch (alertError) {
+      console.error("WeixinBotDO storage alert failed:", errorMessage(alertError));
+    }
   }
 
   private async login(): Promise<LoginSessionState | undefined> {
@@ -671,6 +697,7 @@ export class WeixinBotDO extends DurableObject<Env> {
       return json({ error: "not_found" }, 404);
     } catch (error) {
       console.error("WeixinBotDO:", errorMessage(error));
+      await this.alertStorageFull(error);
       return json({ error: "weixin_error", message: errorMessage(error) }, 400);
     }
   }
