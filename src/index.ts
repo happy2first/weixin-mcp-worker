@@ -126,7 +126,7 @@ async function pollRecipients(env: Env, limit: number, requested?: string[]) {
       return { user: { id: user.id, name: user.name }, success: false, pending: 0, messages: [], error: error instanceof Error ? error.message : String(error) };
     }
   }));
-  const messages = results.flatMap((item) => item.messages || [])
+  const messages: JsonObject[] = results.flatMap((item) => (item.messages || []) as JsonObject[])
     .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")))
     .slice(0, limit);
   return {
