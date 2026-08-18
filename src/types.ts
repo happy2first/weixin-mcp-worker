@@ -7,13 +7,21 @@ export interface Env {
   ILINK_CLIENT_VERSION?: string;
 }
 
+export interface WeixinUserProfile {
+  id: string;
+  name: string;
+  enabled: boolean;
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WeixinAccountState {
   token: string;
   botId: string;
   userId: string;
   baseUrl: string;
   boundAt: string;
-  /** Most recent conversation token received from the bound Weixin user. */
   contextToken?: string;
   lastInboundAt?: string;
   lastNotifyStartAt?: string;
@@ -27,24 +35,6 @@ export interface WeixinSyncState {
   lastPollReceived?: number;
   lastPollIgnored?: number;
   lastPollError?: string;
-}
-
-export type InboundStatus = "pending" | "replied";
-
-export interface InboundMessage {
-  messageRef: string;
-  /** Internal de-duplication key; never returned by MCP tools. */
-  sourceId: string;
-  fromUserId: string;
-  contextToken?: string;
-  text: string;
-  itemTypes: number[];
-  receivedAt: string;
-  createTimeMs?: number;
-  status: InboundStatus;
-  repliedAt?: string;
-  replyMessageIds?: string[];
-  lastReplyError?: string;
 }
 
 export type LoginStatus =
@@ -81,6 +71,13 @@ export interface LoginPollResponse {
   redirect_host?: string;
 }
 
+export interface CDNMediaRef {
+  encrypt_query_param?: string;
+  aes_key?: string;
+  encrypt_type?: number;
+  full_url?: string;
+}
+
 export interface WeixinMessageItem {
   type?: number;
   create_time_ms?: number;
@@ -88,8 +85,41 @@ export interface WeixinMessageItem {
   is_completed?: boolean;
   msg_id?: string;
   text_item?: { text?: string };
-  voice_item?: { text?: string; playtime?: number };
-  file_item?: { file_name?: string; len?: string };
+  image_item?: {
+    media?: CDNMediaRef;
+    thumb_media?: CDNMediaRef;
+    aeskey?: string;
+    url?: string;
+    mid_size?: number;
+    thumb_size?: number;
+    thumb_height?: number;
+    thumb_width?: number;
+    hd_size?: number;
+  };
+  voice_item?: {
+    media?: CDNMediaRef;
+    encode_type?: number;
+    bits_per_sample?: number;
+    sample_rate?: number;
+    playtime?: number;
+    text?: string;
+  };
+  file_item?: {
+    media?: CDNMediaRef;
+    file_name?: string;
+    md5?: string;
+    len?: string;
+  };
+  video_item?: {
+    media?: CDNMediaRef;
+    video_size?: number;
+    play_length?: number;
+    video_md5?: string;
+    thumb_media?: CDNMediaRef;
+    thumb_size?: number;
+    thumb_height?: number;
+    thumb_width?: number;
+  };
   ref_msg?: { title?: string };
 }
 
@@ -117,6 +147,23 @@ export interface GetUpdatesResponse {
   msgs?: WeixinMessage[];
   get_updates_buf?: string;
   longpolling_timeout_ms?: number;
-  /** Local marker set when the Worker intentionally aborts an idle long-poll. */
   timedOut?: boolean;
+}
+
+export type MessageDirection = "inbound" | "outbound";
+export type MessageStatus = "pending" | "replied" | "sent" | "failed";
+export type MessageKind = "text" | "image" | "voice" | "file" | "video" | "mixed" | "unknown";
+
+export interface PublicMessageRecord {
+  messageRef: string;
+  direction: MessageDirection;
+  kind: MessageKind;
+  text: string;
+  status: MessageStatus;
+  createdAt: string;
+  repliedAt?: string;
+  replyTo?: string;
+  metadata?: Record<string, unknown>;
+  externalIds?: string[];
+  error?: string;
 }
