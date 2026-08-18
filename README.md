@@ -2,7 +2,7 @@
 
 Cloudflare-native Remote MCP for Weixin ClawBot.
 
-Current version: **v0.3.0**.
+Current version: **v0.3.x**.
 
 ## Architecture
 
@@ -20,21 +20,21 @@ Cloudflare Worker
         +--> WeixinBotDO: __registry__ --> user registry
 ```
 
-No VPS, OpenClaw, Docker, D1, KV, Pages, Cloudflare Cron, or OpenAI API is required for text send and hourly asynchronous reply handling.
+No VPS, OpenClaw, Docker, D1, KV, Pages, Cloudflare Cron, R2 or OpenAI API is required for the current text send / hourly asynchronous reply path.
 
 ## Main URLs
 
 After binding a custom domain:
 
 ```text
-MCP:   https://weixin.mcp.example.com/mcp
-Admin: https://weixin.mcp.example.com/admin
-Health:https://weixin.mcp.example.com/health
+MCP:    https://weixin.mcp.example.com/mcp
+Admin:  https://weixin.mcp.example.com/admin
+Health: https://weixin.mcp.example.com/health
 ```
 
-`/setup` is retained only as a compatibility redirect to `/admin`.
+`/setup` is retained as a compatibility redirect to `/admin`.
 
-## v0.3 features
+## Current features
 
 - Multiple Weixin recipients in one Worker.
 - Friendly user IDs and display names maintained in `/admin`.
@@ -44,10 +44,10 @@ Health:https://weixin.mcp.example.com/health
 - Hourly/on-demand inbound polling across all enabled users.
 - `messageRef` includes routing information so `weixin_reply` automatically replies through the correct account.
 - SQLite message history per user Durable Object.
-- Stores both inbound text and outbound/reply text history.
-- Admin UI can rename, enable/disable, set default, re-bind, delete users, delete individual messages and clear a user's history.
-- Deleting a user clears that user's stored credentials, cursor and message history.
+- Stores inbound text plus outbound/reply text history.
+- Admin UI can maintain users, bind/re-bind ClawBot, delete users, view/delete message history and clear a user's history.
 - Cloudflare Access protects `/admin`, `/admin/api/*`, `/mcp` and `/health`.
+- Responsive admin shell follows the same desktop/mobile layout model as the author's Personal Gateway prototype: desktop sidebar/top bar and mobile top bar/bottom navigation.
 
 ## MCP tools
 
@@ -116,7 +116,7 @@ The Worker routes the reply to the correct Durable Object and uses the stored co
 
 ## Message history
 
-Each user Durable Object uses SQLite storage for message history instead of one large KV array. Records include:
+Each user Durable Object uses SQLite storage for message history. Records include:
 
 - direction: inbound/outbound
 - kind: text/image/voice/file/video/mixed
@@ -129,25 +129,40 @@ Each user Durable Object uses SQLite storage for message history instead of one 
 
 Raw bot tokens and context tokens are never returned by the admin or MCP APIs.
 
-## Multimedia boundary
+## Multimedia boundary and storage plan
 
-Tencent's current Weixin protocol exposes inbound message item types for:
+Tencent's current Weixin protocol exposes inbound item types for text, image, voice, file and video. The current version records their type and safe metadata. If Weixin includes voice transcription text, that text is preserved in history.
 
-- text
-- image
-- voice
-- file
-- video
+The project intentionally does **not** require R2. For later binary-media persistence, the preferred design is to keep media in the same SQLite-backed Durable Object by splitting each binary object into chunks smaller than Cloudflare's 2 MB SQL row/BLOB limit (target chunk size about 1 MB).
 
-v0.3 records the type and safe metadata. If Weixin includes voice transcription text, that text is preserved in history.
+Planned media tables:
 
-v0.3 does **not** persist the binary image/file/audio/video payload in Durable Object storage. Large binary media should be stored in Cloudflare R2 in a later media-storage extension.
+```text
+media_objects
+  media_id
+  message_ref
+  kind
+  mime_type
+  file_name
+  byte_length
+  chunk_count
+  created_at
 
-Tencent's current official `openclaw-weixin` implementation has outbound upload/send implementations for image, file and video. Outbound voice upload/send is not treated as supported by this project until an equivalent official implementation is available and validated.
+media_chunks
+  media_id
+  chunk_index
+  data BLOB
+```
+
+This avoids a separate paid/billing-gated R2 setup and avoids a separate D1 database/binding. A per-user soft media quota will reserve headroom for messages and indexes. If the Durable Object reaches `SQLITE_FULL`, reads/deletes remain usable and the Worker should send a direct ClawBot storage warning without trying to persist that warning in SQLite.
+
+D1 can technically store chunked BLOB data too, but it is not preferred here because the Worker already has per-user SQLite-backed Durable Objects and D1 Free has a smaller per-database capacity. Keeping state + message history + media attached to the same user object also makes deletion and lifecycle management simpler.
+
+Tencent's current official `openclaw-weixin` implementation has outbound upload/send implementations for image, file and video. Outbound voice upload/send is not treated as supported until an equivalent official implementation is available and validated.
 
 ## Cloudflare resources
 
-Required for v0.3:
+Required:
 
 1. One Worker.
 2. One SQLite-backed Durable Object namespace/class `WeixinBotDO`.
@@ -212,7 +227,7 @@ ILINK_CLIENT_VERSION=2.4.6
 3. Configure Cloudflare Access and variables.
 4. Open `/admin`.
 5. Add the first recipient, e.g. ID `zhenhua`, display name `振华`.
-6. Click scan/bind and scan with the corresponding Weixin account.
+6. Scan/bind with the corresponding Weixin account.
 7. Run a test send.
 8. Add another recipient if needed, e.g. `wife`.
 9. Connect ChatGPT to `/mcp`.
