@@ -534,6 +534,25 @@ export class WeixinBotDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec("UPDATE messages SET metadata_json=? WHERE message_ref=?", JSON.stringify(metadata), messageRef);
   }
 
+  private async persistDeliveredHistory(row: MessageRow): Promise<string | null> {
+    try {
+      this.insertHistory(row);
+      return null;
+    } catch (firstError) {
+      if (isStorageFullError(firstError)) {
+        await this.safeEnforceRetention();
+        try {
+          this.insertHistory(row);
+          return null;
+        } catch (retryError) {
+          await this.alertStorageFull(retryError);
+          return errorMessage(retryError);
+        }
+      }
+      return errorMessage(firstError);
+    }
+  }
+
   private async send(text: string) {
     const account = await this.account();
     if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先在 /admin 完成扫码绑定");
@@ -544,22 +563,23 @@ export class WeixinBotDO extends DurableObject<Env> {
     const messageIds: string[] = [];
     let contextToken = account.contextToken;
     let recovery: string = "none";
+    await this.safeEnforceRetention();
     try {
       for (let i = 0; i < chunks.length; i += 1) {
-        const sent = await this.sendTextWithRecovery(account,account.userId,chunks[i],contextToken);
+        const sent = await this.sendTextWithRecovery(account, account.userId, chunks[i], contextToken);
         messageIds.push(sent.value);
         contextToken = sent.contextToken;
         if (sent.recovery !== "none") recovery = sent.recovery;
         if (i < chunks.length - 1) await sleep(SEND_CHUNK_DELAY_MS);
       }
-      this.insertHistory({ message_ref:ref,source_id:null,direction:"outbound",kind:"text",text,status:"sent",context_token:null,from_user_id:null,created_at:new Date().toISOString(),replied_at:null,reply_to:null,metadata_json:JSON.stringify({ chunks: chunks.length, recovery }),external_ids_json:JSON.stringify(messageIds),error:null });
-      const cleanup = await this.safeEnforceRetention();
-      return { success:true,messageRef:ref,recipient:maskId(account.userId),chunks:chunks.length,messageIds,recovery,cleanup };
     } catch (error) {
       try { this.insertHistory({ message_ref:ref,source_id:null,direction:"outbound",kind:"text",text,status:"failed",context_token:null,from_user_id:null,created_at:new Date().toISOString(),replied_at:null,reply_to:null,metadata_json:JSON.stringify({ chunks:chunks.length,recovery }),external_ids_json:JSON.stringify(messageIds),error:errorMessage(error) }); } catch (historyError) { await this.alertStorageFull(historyError); }
       await this.safeEnforceRetention();
       throw error;
     }
+    const historyWarning = await this.persistDeliveredHistory({ message_ref:ref,source_id:null,direction:"outbound",kind:"text",text,status:"sent",context_token:null,from_user_id:null,created_at:new Date().toISOString(),replied_at:null,reply_to:null,metadata_json:JSON.stringify({ chunks: chunks.length, recovery }),external_ids_json:JSON.stringify(messageIds),error:null });
+    const cleanup = await this.safeEnforceRetention();
+    return { success:true,messageRef:ref,recipient:maskId(account.userId),chunks:chunks.length,messageIds,recovery,historyWarning,cleanup };
   }
 
   private async sendMedia(body: Record<string, unknown>) {
