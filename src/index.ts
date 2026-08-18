@@ -1,13 +1,15 @@
+import { Buffer } from "node:buffer";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import QRCode from "qrcode";
 import { z } from "zod";
 import { ADMIN_PAGE } from "./setup-page.js";
-import type { Env, WeixinUserProfile } from "./types.js";
+import { MAX_MEDIA_BYTES, MCP_EMBED_MAX_BYTES } from "./media.js";
+import type { Env, SendableMediaKind, WeixinUserProfile } from "./types.js";
 export { WeixinBotDO } from "./weixin-bot.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const REGISTRY_DO = "__registry__";
 
 type JsonObject = Record<string, any>;
@@ -50,8 +52,16 @@ function callRegistry(env: Env, path: string, init?: RequestInit) {
   return callStub(stubByName(env, REGISTRY_DO), path, init);
 }
 
+function userStub(env: Env, userId: string) {
+  return stubByName(env, `user:${normalizeProfileId(userId)}`);
+}
+
 function callUser(env: Env, userId: string, path: string, init?: RequestInit) {
-  return callStub(stubByName(env, `user:${normalizeProfileId(userId)}`), path, init);
+  return callStub(userStub(env, userId), path, init);
+}
+
+async function callUserRaw(env: Env, userId: string, path: string, init?: RequestInit): Promise<Response> {
+  return userStub(env, userId).fetch(`https://weixin-bot.internal${path}`, init as any);
 }
 
 async function profiles(env: Env): Promise<WeixinUserProfile[]> {
@@ -104,11 +114,32 @@ async function sendToRecipients(env: Env, text: string, requested?: string[]) {
   return { success: results.every((item) => item.success), recipients: results };
 }
 
+function routeMediaMetadata(metadata: unknown, user: WeixinUserProfile): unknown {
+  if (!metadata || typeof metadata !== "object") return metadata;
+  const copy = { ...(metadata as JsonObject) };
+  if (Array.isArray(copy.media)) {
+    copy.media = copy.media.map((media: JsonObject) => ({
+      ...media,
+      mediaRef: media.mediaRef ? `${user.id}:${media.mediaRef}` : media.mediaRef,
+      user: { id: user.id, name: user.name },
+    }));
+  }
+  return copy;
+}
+
+function routeMessage(message: JsonObject, user: WeixinUserProfile): JsonObject {
+  return {
+    ...message,
+    messageRef: `${user.id}:${message.messageRef}`,
+    ...(message.replyTo ? { replyTo: `${user.id}:${message.replyTo}` } : {}),
+    metadata: routeMediaMetadata(message.metadata, user),
+    user: { id: user.id, name: user.name },
+  };
+}
+
 async function pollRecipients(env: Env, limit: number, requested?: string[]) {
   const all = await profiles(env);
-  const targets = requested?.length
-    ? await resolveRecipients(env, requested)
-    : all.filter((user) => user.enabled);
+  const targets = requested?.length ? await resolveRecipients(env, requested) : all.filter((user) => user.enabled);
   if (!targets.length) return { success: true, pending: 0, messages: [], users: [] };
   const perUserLimit = Math.min(50, Math.max(1, limit));
   const results = await Promise.all(targets.map(async (user) => {
@@ -116,30 +147,25 @@ async function pollRecipients(env: Env, limit: number, requested?: string[]) {
       const response = await callUser(env, user.id, "/poll", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: perUserLimit }),
       });
-      const messages = (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => ({
-        ...message,
-        messageRef: `${user.id}:${message.messageRef}`,
-        user: { id: user.id, name: user.name },
-      }));
+      const messages: JsonObject[] = (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => routeMessage(message, user));
       return { user: { id: user.id, name: user.name }, success: true, ...response, messages };
     } catch (error) {
-      return { user: { id: user.id, name: user.name }, success: false, pending: 0, messages: [], error: error instanceof Error ? error.message : String(error) };
+      return { user: { id: user.id, name: user.name }, success: false, pending: 0, messages: [] as JsonObject[], error: error instanceof Error ? error.message : String(error) };
     }
   }));
-  const messages: JsonObject[] = results.flatMap((item) => (item.messages || []) as JsonObject[])
-    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")))
-    .slice(0, limit);
+  const messages: JsonObject[] = results.flatMap((item) => item.messages || []);
+  messages.sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
   return {
     success: results.every((item) => item.success),
     pending: results.reduce((sum, item) => sum + Number(item.pending || 0), 0),
-    messages,
+    messages: messages.slice(0, limit),
     users: results.map(({ messages: _messages, ...rest }) => rest),
   };
 }
 
 function splitGlobalRef(globalRef: string): { userId: string; localRef: string } {
   const index = globalRef.indexOf(":");
-  if (index <= 0) throw new Error("messageRef 格式无效，请使用 weixin_poll 返回的原值");
+  if (index <= 0) throw new Error("引用格式无效，请使用 MCP 返回的原值");
   return { userId: normalizeProfileId(globalRef.slice(0, index)), localRef: globalRef.slice(index + 1) };
 }
 
@@ -161,21 +187,123 @@ async function aggregateMessages(env: Env, limit: number) {
       const response = await callUser(env, user.id, `/messages?limit=${Math.min(200, limit)}&offset=0`, { method: "GET" });
       return {
         total: Number(response.total || 0),
-        messages: (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => ({
-          ...message,
-          messageRef: `${user.id}:${message.messageRef}`,
-          ...(message.replyTo ? { replyTo: `${user.id}:${message.replyTo}` } : {}),
-          user: { id: user.id, name: user.name },
-        })),
+        messages: (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => routeMessage(message, user)),
       };
     } catch {
       return { total: 0, messages: [] as JsonObject[] };
     }
   }));
-  const messages = data.flatMap((item) => item.messages)
-    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
-    .slice(0, limit);
-  return { total: data.reduce((sum, item) => sum + item.total, 0), messages };
+  const messages: JsonObject[] = data.flatMap((item) => item.messages);
+  messages.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  return { total: data.reduce((sum, item) => sum + item.total, 0), messages: messages.slice(0, limit) };
+}
+
+async function readGlobalMedia(env: Env, globalMediaRef: string): Promise<{ response: Response; userId: string; localRef: string }> {
+  const { userId, localRef } = splitGlobalRef(globalMediaRef);
+  const response = await callUserRaw(env, userId, `/media/${encodeURIComponent(localRef)}`, { method: "GET" });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({})) as JsonObject;
+    throw new Error(data.message || data.error || `读取媒体失败：HTTP ${response.status}`);
+  }
+  return { response, userId, localRef };
+}
+
+async function resolveMediaSource(env: Env, params: { dataBase64?: string; sourceMediaRef?: string; kind: SendableMediaKind; mimeType?: string; fileName?: string }) {
+  const hasBase64 = Boolean(params.dataBase64?.trim());
+  const hasRef = Boolean(params.sourceMediaRef?.trim());
+  if (hasBase64 === hasRef) throw new Error("dataBase64 和 sourceMediaRef 必须且只能提供一个");
+  if (hasBase64) {
+    const bytes = new Uint8Array(Buffer.from(params.dataBase64!.trim(), "base64"));
+    if (!bytes.byteLength) throw new Error("dataBase64 为空或无效");
+    if (bytes.byteLength > MAX_MEDIA_BYTES) throw new Error(`媒体超过 ${Math.floor(MAX_MEDIA_BYTES / 1024 / 1024)}MB 上限`);
+    return {
+      bytes,
+      kind: params.kind,
+      mimeType: params.mimeType?.trim() || "application/octet-stream",
+      fileName: params.fileName?.trim() || (params.kind === "image" ? "image.jpg" : params.kind === "video" ? "video.mp4" : "file.bin"),
+    };
+  }
+  const media = await readGlobalMedia(env, params.sourceMediaRef!);
+  const bytes = new Uint8Array(await media.response.arrayBuffer());
+  const sourceKind = media.response.headers.get("x-weixin-media-kind") || "";
+  if (sourceKind === "voice") throw new Error("当前官方微信发送链路尚未验证语音上传发送，不能转发语音媒体");
+  if (!["image", "file", "video"].includes(sourceKind)) throw new Error(`sourceMediaRef 的媒体类型 ${sourceKind || "unknown"} 不支持发送`);
+  return {
+    bytes,
+    kind: sourceKind as SendableMediaKind,
+    mimeType: media.response.headers.get("content-type") || params.mimeType?.trim() || "application/octet-stream",
+    fileName: decodeURIComponent((media.response.headers.get("content-disposition") || "").match(/filename\*=UTF-8''([^;]+)/i)?.[1] || "")
+      || params.fileName?.trim()
+      || (sourceKind === "image" ? "image.jpg" : sourceKind === "video" ? "video.mp4" : "file.bin"),
+  };
+}
+
+async function sendMediaToRecipients(
+  env: Env,
+  params: { recipients?: string[]; kind: SendableMediaKind; dataBase64?: string; sourceMediaRef?: string; mimeType?: string; fileName?: string; caption?: string },
+) {
+  const targets = await resolveRecipients(env, params.recipients);
+  const source = await resolveMediaSource(env, params);
+  const dataBase64 = Buffer.from(source.bytes).toString("base64");
+  const results = await Promise.all(targets.map(async (user) => {
+    try {
+      const response = await callUser(env, user.id, "/send-media", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: source.kind,
+          dataBase64,
+          mimeType: source.mimeType,
+          fileName: source.fileName,
+          caption: params.caption || "",
+        }),
+      });
+      return { user: { id: user.id, name: user.name }, success: true, ...response };
+    } catch (error) {
+      return { user: { id: user.id, name: user.name }, success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }));
+  return {
+    success: results.every((item) => item.success),
+    source: { kind: source.kind, mimeType: source.mimeType, fileName: source.fileName, sizeBytes: source.bytes.byteLength },
+    recipients: results,
+  };
+}
+
+async function mediaToolResult(env: Env, globalMediaRef: string) {
+  const { response } = await readGlobalMedia(env, globalMediaRef);
+  const size = Number(response.headers.get("content-length") || "0");
+  const mimeType = response.headers.get("content-type") || "application/octet-stream";
+  const kind = response.headers.get("x-weixin-media-kind") || "file";
+  const fileName = decodeURIComponent((response.headers.get("content-disposition") || "").match(/filename\*=UTF-8''([^;]+)/i)?.[1] || "") || "media.bin";
+  if (size > MCP_EMBED_MAX_BYTES) {
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify({
+        mediaRef: globalMediaRef,
+        kind,
+        mimeType,
+        fileName,
+        sizeBytes: size,
+        embedded: false,
+        reason: `媒体超过 MCP 内嵌安全上限 ${Math.floor(MCP_EMBED_MAX_BYTES / 1024 / 1024)}MB，可在 /admin 下载查看。`,
+      }, null, 2) }],
+    };
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const data = Buffer.from(bytes).toString("base64");
+  const meta = { type: "text" as const, text: JSON.stringify({ mediaRef: globalMediaRef, kind, mimeType, fileName, sizeBytes: bytes.byteLength, embedded: true }, null, 2) };
+  if (mimeType.startsWith("image/")) {
+    return { content: [meta, { type: "image", data, mimeType }] as any };
+  }
+  if (["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4"].includes(mimeType)) {
+    return { content: [meta, { type: "audio", data, mimeType }] as any };
+  }
+  return {
+    content: [meta, {
+      type: "resource",
+      resource: { uri: `weixin-media://${encodeURIComponent(globalMediaRef)}`, mimeType, blob: data },
+    }] as any,
+  };
 }
 
 function createServer(env: Env) {
@@ -187,25 +315,43 @@ function createServer(env: Env) {
   }, async () => result(await usersWithStatus(env)));
 
   server.registerTool("weixin_status", {
-    description: "检查整个微信 MCP 的多用户绑定、待处理消息和最近轮询状态。不会返回 bot_token/context_token。",
+    description: "检查整个微信 MCP 的多用户绑定、消息、媒体存储和最近轮询状态。不会返回 bot_token/context_token。",
     inputSchema: {},
   }, async () => result(await usersWithStatus(env)));
 
   server.registerTool("weixin_send", {
     description: "把文本发送给一个或多个已配置微信用户。recipients 使用 /admin 中定义的用户标识；省略时发送给默认用户。",
     inputSchema: {
-      recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional().describe("收信用户标识数组，例如 ['zhenhua','wife']。省略则发默认用户。"),
-      text: z.string().min(1).max(70_000).describe("要发送的文本内容。"),
+      recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional(),
+      text: z.string().min(1).max(70_000),
     },
   }, async ({ recipients, text }) => result(await sendToRecipients(env, text, recipients)));
 
+  server.registerTool("weixin_send_media", {
+    description: "发送图片、文件或视频给一个或多个已配置微信用户。媒体来源可为 base64，或 weixin_poll/weixin_media_get 返回的 sourceMediaRef。当前不发送语音。",
+    inputSchema: {
+      recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional(),
+      kind: z.enum(["image", "file", "video"]),
+      dataBase64: z.string().optional().describe("媒体原始字节的 base64；与 sourceMediaRef 二选一。"),
+      sourceMediaRef: z.string().optional().describe("已有微信媒体引用；与 dataBase64 二选一。"),
+      mimeType: z.string().max(120).optional(),
+      fileName: z.string().max(180).optional(),
+      caption: z.string().max(70_000).optional(),
+    },
+  }, async (args) => result(await sendMediaToRecipients(env, args as any)));
+
   server.registerTool("weixin_poll", {
-    description: "按需拉取所有启用微信用户发给各自 ClawBot 的新消息，适合 ChatGPT 每小时任务调用。返回的 messageRef 已包含用户路由信息。",
+    description: "按需拉取所有启用微信用户发给各自 ClawBot 的新消息，包括图片/语音/文件/视频的 mediaRef。适合 ChatGPT 每小时任务调用。",
     inputSchema: {
       limit: z.number().int().min(1).max(100).optional().default(20),
-      recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional().describe("可选：只轮询指定用户；省略则轮询所有启用用户。"),
+      recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional(),
     },
   }, async ({ limit, recipients }) => result(await pollRecipients(env, limit, recipients)));
+
+  server.registerTool("weixin_media_get", {
+    description: "读取 weixin_poll 返回的 mediaRef。图片/常见音频以内嵌 MCP 多模态内容返回；其他文件作为二进制 resource 返回。",
+    inputSchema: { mediaRef: z.string().min(3).max(220) },
+  }, async ({ mediaRef }) => mediaToolResult(env, mediaRef));
 
   server.registerTool("weixin_reply", {
     description: "回复 weixin_poll 返回的具体微信消息。直接使用其 messageRef；Worker 会自动定位用户和 context_token。",
@@ -231,7 +377,6 @@ async function handleAdmin(request: Request, env: Env, pathname: string): Promis
   }
   if (request.method !== "POST") return Response.json({ error: "method_not_allowed" }, { status: 405 });
   const body = await request.json().catch(() => ({})) as Record<string, unknown>;
-
   if (pathname === "/admin/api/users/create") {
     return Response.json(await callRegistry(env, "/registry/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
   }
@@ -260,6 +405,10 @@ async function handleAdmin(request: Request, env: Env, pathname: string): Promis
     const userId = normalizeProfileId(body.userId);
     return Response.json(await callUser(env, userId, "/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: body.text }) }));
   }
+  if (pathname === "/admin/api/send-media") {
+    const userId = normalizeProfileId(body.userId);
+    return Response.json(await callUser(env, userId, "/send-media", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+  }
   if (pathname === "/admin/api/poll") {
     const userId = normalizeProfileId(body.userId);
     return Response.json(await callUser(env, userId, "/poll", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: body.limit || 20 }) }));
@@ -281,6 +430,19 @@ async function handleAdmin(request: Request, env: Env, pathname: string): Promis
   return Response.json({ error: "not_found" }, { status: 404 });
 }
 
+async function handleAdminMedia(env: Env, pathname: string): Promise<Response> {
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts.length !== 4 || parts[0] !== "admin" || parts[1] !== "media") return new Response("Not Found", { status: 404 });
+  const userId = normalizeProfileId(decodeURIComponent(parts[2]));
+  const mediaRef = decodeURIComponent(parts[3]);
+  const response = await callUserRaw(env, userId, `/media/${encodeURIComponent(mediaRef)}`, { method: "GET" });
+  if (!response.ok) return response;
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "private, max-age=3600");
+  headers.set("x-robots-tag", "noindex, nofollow");
+  return new Response(response.body, { status: response.status, headers });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -288,9 +450,8 @@ export default {
       return Response.json({ ok: true, service: "weixin-mcp-worker", version: VERSION, mcp: "/mcp", admin: "/admin", health: "/health" });
     }
     if (url.pathname === "/setup") return Response.redirect(new URL("/admin", request.url).toString(), 308);
-    if (url.pathname !== "/mcp" && url.pathname !== "/health" && url.pathname !== "/admin" && !url.pathname.startsWith("/admin/api/")) {
-      return new Response("Not Found", { status: 404 });
-    }
+    const allowed = url.pathname === "/mcp" || url.pathname === "/health" || url.pathname === "/admin" || url.pathname.startsWith("/admin/api/") || url.pathname.startsWith("/admin/media/");
+    if (!allowed) return new Response("Not Found", { status: 404 });
 
     let identity;
     try { identity = await verifyAccess(request, env); } catch (error) { return accessDenied(error); }
@@ -299,6 +460,10 @@ export default {
       return new Response(ADMIN_PAGE, {
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" },
       });
+    }
+    if (url.pathname.startsWith("/admin/media/")) {
+      try { return await handleAdminMedia(env, url.pathname); }
+      catch (error) { return Response.json({ error: "media_error", message: error instanceof Error ? error.message : String(error) }, { status: 400 }); }
     }
     if (url.pathname.startsWith("/admin/api/")) {
       try { return await handleAdmin(request, env, url.pathname); }

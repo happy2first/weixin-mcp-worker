@@ -1,30 +1,23 @@
 # weixin-mcp-worker
 
-Cloudflare-native Remote MCP for Weixin ClawBot.
-
-Current version: **v0.3.x**.
+Cloudflare-native Remote MCP for Weixin ClawBot. Current version: **v0.4.0**.
 
 ## Architecture
 
 ```text
 ChatGPT / scheduled task
-        |
         | Remote MCP /mcp
         v
 Cloudflare Worker
         |
         +--> WeixinBotDO: user:zhenhua --> Weixin ClawBot --> Weixin A
-        |
         +--> WeixinBotDO: user:wife    --> Weixin ClawBot --> Weixin B
-        |
         +--> WeixinBotDO: __registry__ --> user registry
 ```
 
-No VPS, OpenClaw, Docker, D1, KV, Pages, Cloudflare Cron, R2 or OpenAI API is required for the current text send / hourly asynchronous reply path.
+No VPS, OpenClaw, D1, KV, R2, Pages, Cloudflare Cron, or OpenAI API is required.
 
 ## Main URLs
-
-After binding a custom domain:
 
 ```text
 MCP:    https://weixin.mcp.example.com/mcp
@@ -32,180 +25,103 @@ Admin:  https://weixin.mcp.example.com/admin
 Health: https://weixin.mcp.example.com/health
 ```
 
-`/setup` is retained as a compatibility redirect to `/admin`.
+`/setup` redirects to `/admin` for compatibility.
 
-## Current features
+## v0.4 features
 
-- Multiple Weixin recipients in one Worker.
-- Friendly user IDs and display names maintained in `/admin`.
-- One default recipient; `weixin_send` can omit `recipients` and send to the default.
-- Send to one or several configured recipients by ID.
-- Each recipient has an independent Durable Object instance, bot token, cursor and context token.
-- Hourly/on-demand inbound polling across all enabled users.
-- `messageRef` includes routing information so `weixin_reply` automatically replies through the correct account.
-- SQLite message history per user Durable Object.
-- Stores inbound text plus outbound/reply text history.
-- Admin UI can maintain users, bind/re-bind ClawBot, delete users, view/delete message history and clear a user's history.
-- Cloudflare Access protects `/admin`, `/admin/api/*`, `/mcp` and `/health`.
-- Responsive admin shell follows the same desktop/mobile layout model as the author's Personal Gateway prototype: desktop sidebar/top bar and mobile top bar/bottom navigation.
+- Multiple bound Weixin recipients with administrator-defined aliases.
+- Text send, on-demand/hourly inbound polling, and text reply.
+- Inbound image, voice, file and video download/decryption from Weixin CDN.
+- Media stored inside each user's SQLite-backed Durable Object; no R2 required.
+- Media is split into approximately 1 MiB BLOB rows.
+- 20 MiB per-media safety limit.
+- 750 MiB per-user media soft quota. New media stops being persisted at the soft quota and the bound ClawBot receives a cleanup warning.
+- Hard SQLite `SQLITE_FULL` errors also trigger a direct ClawBot warning where possible.
+- `/admin` supports responsive desktop/mobile management, media preview/playback/download, media upload/send, history deletion and per-user cleanup.
+- Outbound image, file and video use Weixin's official `getuploadurl` + AES-128-ECB CDN upload + `sendmessage` flow.
+- Inbound voice is preserved in the format delivered by Weixin; Weixin-provided transcript text is retained. SILK is not transcoded to WAV inside Workers.
+- Outbound voice is intentionally not exposed until an equivalent official send flow is validated.
 
 ## MCP tools
 
 ### `weixin_users`
-
-Lists configured recipients and binding status.
+List configured recipients and connection/storage status.
 
 ### `weixin_status`
-
-Returns multi-user connection/sync status without exposing raw credentials.
+Inspect multi-user connection, pending messages and media usage without exposing raw credentials.
 
 ### `weixin_send`
 
-Send to the default user:
-
 ```json
-{
-  "text": "房地产监测结果……"
-}
+{ "text": "房地产监测结果……" }
 ```
 
-Send to selected users:
+Or selected recipients:
 
 ```json
-{
-  "recipients": ["zhenhua", "wife"],
-  "text": "家庭提醒……"
-}
+{ "recipients": ["zhenhua", "wife"], "text": "家庭提醒……" }
 ```
-
-Recipient IDs can only be IDs pre-created in `/admin`; arbitrary Weixin IDs cannot be supplied.
 
 ### `weixin_poll`
+Pull pending inbound messages for all enabled users or selected recipients. Media messages include a routed `mediaRef` such as `zhenhua:media_...`.
+
+### `weixin_media_get`
+Read a `mediaRef`. Images and common audio formats are returned as MCP multimodal content. Other files/video are returned as binary resource content. Media larger than 8 MiB is not embedded into a tool result; use `/admin` to open/download it.
+
+### `weixin_send_media`
+Send `image`, `file`, or `video` to one or several configured recipients. Input can be raw base64 or an existing `sourceMediaRef` from this MCP.
+
+Example:
 
 ```json
 {
-  "limit": 20
-}
-```
-
-By default polls all enabled users. It returns pending messages with a global `messageRef` such as:
-
-```text
-zhenhua:wxmsg_...
-```
-
-Optional recipient filter:
-
-```json
-{
-  "limit": 20,
-  "recipients": ["zhenhua"]
+  "recipients": ["zhenhua"],
+  "kind": "image",
+  "dataBase64": "...",
+  "mimeType": "image/jpeg",
+  "fileName": "photo.jpg",
+  "caption": "图片说明"
 }
 ```
 
 ### `weixin_reply`
+Reply to the exact `messageRef` returned by `weixin_poll`; the Worker routes to the correct user and stored context token.
 
-```json
-{
-  "messageRef": "zhenhua:wxmsg_...",
-  "text": "回复内容……"
-}
-```
+## Media storage model
 
-The Worker routes the reply to the correct Durable Object and uses the stored context token.
-
-## Message history
-
-Each user Durable Object uses SQLite storage for message history. Records include:
-
-- direction: inbound/outbound
-- kind: text/image/voice/file/video/mixed
-- text or safe textual representation
-- status
-- timestamps
-- reply relationship
-- Weixin message IDs
-- safe media metadata
-
-Raw bot tokens and context tokens are never returned by the admin or MCP APIs.
-
-## Multimedia boundary and storage plan
-
-Tencent's current Weixin protocol exposes inbound item types for text, image, voice, file and video. The current version records their type and safe metadata. If Weixin includes voice transcription text, that text is preserved in history.
-
-The project intentionally does **not** require R2. For later binary-media persistence, the preferred design is to keep media in the same SQLite-backed Durable Object by splitting each binary object into chunks smaller than Cloudflare's 2 MB SQL row/BLOB limit (target chunk size about 1 MB).
-
-Planned media tables:
+Each `user:<alias>` Durable Object creates:
 
 ```text
+messages
 media_objects
-  media_id
-  message_ref
-  kind
-  mime_type
-  file_name
-  byte_length
-  chunk_count
-  created_at
-
 media_chunks
-  media_id
-  chunk_index
-  data BLOB
 ```
 
-This avoids a separate paid/billing-gated R2 setup and avoids a separate D1 database/binding. A per-user soft media quota will reserve headroom for messages and indexes. If the Durable Object reaches `SQLITE_FULL`, reads/deletes remain usable and the Worker should send a direct ClawBot storage warning without trying to persist that warning in SQLite.
+Deleting a message deletes its related media object and chunks. Clearing a user's history clears all message/media rows but keeps the Weixin binding. Deleting a user clears binding credentials, cursor, history, and media.
 
-D1 can technically store chunked BLOB data too, but it is not preferred here because the Worker already has per-user SQLite-backed Durable Objects and D1 Free has a smaller per-database capacity. Keeping state + message history + media attached to the same user object also makes deletion and lifecycle management simpler.
+## Admin UI
 
-Tencent's current official `openclaw-weixin` implementation has outbound upload/send implementations for image, file and video. Outbound voice upload/send is not treated as supported until an equivalent official implementation is available and validated.
+`/admin` follows the responsive structure used by the companion personal-gateway prototype:
+
+- desktop: fixed left navigation + sticky top status bar;
+- tablet: compact side navigation;
+- mobile: top bar + bottom primary navigation.
+
+The message view renders image previews, video playback, supported browser audio playback, and file/raw-voice download links.
 
 ## Cloudflare resources
 
 Required:
 
 1. One Worker.
-2. One SQLite-backed Durable Object namespace/class `WeixinBotDO`.
-3. One binding named `WEIXIN_BOT`.
+2. One SQLite-backed Durable Object class/namespace `WeixinBotDO`.
+3. Binding `WEIXIN_BOT`.
 4. Cloudflare Access.
 5. Optional custom domain.
 
-The same Durable Object namespace contains multiple named objects:
-
-```text
-__registry__
-user:zhenhua
-user:wife
-...
-```
-
-No extra Durable Object namespace is needed when more users are added.
-
-`wrangler.jsonc` already declares the Durable Object binding and SQLite storage. The first `npx wrangler deploy` reconciles/provisions it.
-
-## Deploy from GitHub
-
-Cloudflare Dashboard:
-
-1. Workers & Pages.
-2. Import repository.
-3. Select `happy2first/weixin-mcp-worker`.
-4. Worker name: `weixin-mcp-worker`.
-5. Production branch: `main`.
-6. Deploy command: `npx wrangler deploy`.
-7. No separate build command is required.
-
-After deploy verify:
-
-```text
-Binding: WEIXIN_BOT
-Class:   WeixinBotDO
-Storage: SQLite
-```
+`wrangler.jsonc` already declares the Durable Object export and binding. A deploy reconciles/provisions it.
 
 ## Cloudflare Access variables
-
-Set Worker variables:
 
 ```text
 TEAM_DOMAIN=https://your-team.cloudflareaccess.com
@@ -222,38 +138,37 @@ ILINK_CLIENT_VERSION=2.4.6
 
 ## First-use flow
 
-1. Deploy Worker.
-2. Bind custom domain.
-3. Configure Cloudflare Access and variables.
+1. Import `happy2first/weixin-mcp-worker` from GitHub into Workers.
+2. Deploy with `npx wrangler deploy`.
+3. Bind the custom domain and configure Cloudflare Access/variables.
 4. Open `/admin`.
-5. Add the first recipient, e.g. ID `zhenhua`, display name `振华`.
-6. Scan/bind with the corresponding Weixin account.
-7. Run a test send.
-8. Add another recipient if needed, e.g. `wife`.
-9. Connect ChatGPT to `/mcp`.
+5. Add a recipient alias and scan the generated Weixin QR code.
+6. Test text send, then image/file send.
+7. Send media to ClawBot and press **拉取回复** to validate inbound download/decryption.
+8. Connect ChatGPT to `/mcp`.
 
 ## Hourly asynchronous inbound task
 
-Suggested ChatGPT Task behavior:
-
 ```text
-Every hour, call weixin_poll. If pending Weixin messages exist, process each one using the relevant connected tools and context, then call weixin_reply with the exact returned messageRef and the final answer. If there are no pending messages, do nothing.
+Every hour, call weixin_poll. For each pending message, inspect mediaRef with
+weixin_media_get when needed, process the message using the relevant connected
+tools, then call weixin_reply with the exact returned messageRef. If no pending
+messages exist, do nothing.
 ```
 
-This is not real-time push; expected scheduling delay is up to the task interval.
+This is asynchronous, not real-time push.
 
 ## Security
 
-- No Weixin credentials are committed to GitHub.
-- Each user token is stored only in that user's Durable Object.
-- Recipient IDs are administrator-defined aliases, not arbitrary Weixin IDs.
-- Admin and MCP routes require Cloudflare Access JWT validation.
-- Deleting a configured user clears its local token, cursor and message history.
+- Weixin bot tokens/context tokens are not committed or returned by admin/MCP APIs.
+- Recipient aliases must be pre-created in `/admin`.
+- Admin, media routes and MCP routes are protected by Cloudflare Access.
+- Media URLs are internal admin routes, not public R2 URLs.
+- Raw media is bounded and stored per-user in the same Durable Object as its message state.
 
-## References
+## Protocol references
 
-- Tencent official channel: `https://github.com/Tencent/openclaw-weixin`
-- Community MCP inspiration: `https://github.com/bkmashiro/weixin-mcp`
+Implementation follows Tencent's current `Tencent/openclaw-weixin` protocol behavior for QR login, `getupdates`, Weixin CDN media download/decryption, `getuploadurl`, AES-128-ECB upload, and image/file/video `sendmessage` items.
 
 This repository is independent and is not an official Tencent or Weixin product.
 

@@ -150,9 +150,26 @@ export interface GetUpdatesResponse {
   timedOut?: boolean;
 }
 
+export interface GetUploadUrlResponse {
+  upload_param?: string;
+  thumb_upload_param?: string;
+  upload_full_url?: string;
+}
+
 export type MessageDirection = "inbound" | "outbound";
 export type MessageStatus = "pending" | "replied" | "sent" | "failed";
 export type MessageKind = "text" | "image" | "voice" | "file" | "video" | "mixed" | "unknown";
+export type SendableMediaKind = "image" | "file" | "video";
+
+export interface StoredMediaDescriptor {
+  mediaRef: string;
+  kind: Extract<MessageKind, "image" | "voice" | "file" | "video">;
+  mimeType: string;
+  fileName: string;
+  sizeBytes: number;
+  itemIndex: number;
+  createdAt: string;
+}
 
 export interface PublicMessageRecord {
   messageRef: string;
@@ -163,7 +180,15 @@ export interface PublicMessageRecord {
   createdAt: string;
   repliedAt?: string;
   replyTo?: string;
-  metadata?: Record<string, unknown>;
+  metadata?: Record<string, unknown> & { media?: StoredMediaDescriptor[]; mediaErrors?: string[] };
   externalIds?: string[];
   error?: string;
+}
+
+export interface UploadedMediaInfo {
+  filekey: string;
+  downloadEncryptedQueryParam: string;
+  aesKeyHex: string;
+  fileSize: number;
+  fileSizeCiphertext: number;
 }

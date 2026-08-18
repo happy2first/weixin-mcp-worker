@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { DurableObject } from "cloudflare:workers";
 import {
   fetchLoginQr,
@@ -7,12 +8,23 @@ import {
   notifyStart,
   pollLoginStatus,
   sendTextMessage,
+  sendUploadedMediaMessage,
+  uploadMediaBuffer,
 } from "./ilink.js";
+import {
+  downloadInboundMedia,
+  MAX_MEDIA_BYTES,
+  MEDIA_CHUNK_BYTES,
+  MEDIA_SOFT_QUOTA_BYTES,
+  sanitizeFileName,
+} from "./media.js";
 import type {
   Env,
   LoginSessionState,
   MessageKind,
   PublicMessageRecord,
+  SendableMediaKind,
+  StoredMediaDescriptor,
   WeixinAccountState,
   WeixinMessage,
   WeixinMessageItem,
@@ -45,6 +57,20 @@ type MessageRow = {
   external_ids_json: string | null;
   error: string | null;
 };
+
+type MediaRow = {
+  media_ref: string;
+  message_ref: string;
+  item_index: number;
+  kind: "image" | "voice" | "file" | "video";
+  mime_type: string;
+  file_name: string;
+  size_bytes: number;
+  chunk_count: number;
+  created_at: string;
+};
+
+type MediaChunkRow = { data: unknown };
 
 type PollResult = {
   success: true;
@@ -93,29 +119,19 @@ function splitText(text: string, max = SEND_CHUNK_SIZE): string[] {
 
 function itemText(item: WeixinMessageItem): string {
   switch (item.type) {
-    case 1:
-      return item.text_item?.text?.trim() || "";
-    case 2:
-      return "[图片]";
-    case 3:
-      return item.voice_item?.text?.trim()
-        ? `[语音转文字] ${item.voice_item.text.trim()}`
-        : "[语音消息]";
-    case 4:
-      return item.file_item?.file_name ? `[文件] ${item.file_item.file_name}` : "[文件]";
-    case 5:
-      return "[视频]";
-    default:
-      return item.type == null ? "[未知消息]" : `[消息类型 ${item.type}]`;
+    case 1: return item.text_item?.text?.trim() || "";
+    case 2: return "[图片]";
+    case 3: return item.voice_item?.text?.trim() ? `[语音转文字] ${item.voice_item.text.trim()}` : "[语音消息]";
+    case 4: return item.file_item?.file_name ? `[文件] ${item.file_item.file_name}` : "[文件]";
+    case 5: return "[视频]";
+    default: return item.type == null ? "[未知消息]" : `[消息类型 ${item.type}]`;
   }
 }
 
 function messageText(message: WeixinMessage): string {
   const text = (message.item_list || []).map(itemText).filter(Boolean).join("\n").trim();
   const normalized = text || "[无文本内容]";
-  return normalized.length > MAX_INBOUND_TEXT
-    ? `${normalized.slice(0, MAX_INBOUND_TEXT)}\n[内容已截断]`
-    : normalized;
+  return normalized.length > MAX_INBOUND_TEXT ? `${normalized.slice(0, MAX_INBOUND_TEXT)}\n[内容已截断]` : normalized;
 }
 
 function sourceId(message: WeixinMessage): string {
@@ -153,6 +169,7 @@ function safeMediaMetadata(message: WeixinMessage): Record<string, unknown> {
       type: "voice",
       transcript: item.voice_item?.text || null,
       playtimeMs: item.voice_item?.playtime ?? null,
+      encodeType: item.voice_item?.encode_type ?? null,
       sampleRate: item.voice_item?.sample_rate ?? null,
       hasMedia: Boolean(item.voice_item?.media?.encrypt_query_param || item.voice_item?.media?.full_url),
     };
@@ -202,6 +219,26 @@ function normalizeProfileId(value: unknown): string {
   return id;
 }
 
+function mediaDescriptor(row: MediaRow): StoredMediaDescriptor {
+  return {
+    mediaRef: row.media_ref,
+    kind: row.kind,
+    mimeType: row.mime_type,
+    fileName: row.file_name,
+    sizeBytes: Number(row.size_bytes),
+    itemIndex: Number(row.item_index),
+    createdAt: row.created_at,
+  };
+}
+
+function binaryFromSql(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  if (typeof value === "string") return new Uint8Array(Buffer.from(value, "base64"));
+  throw new Error("SQLite 返回了无法识别的 BLOB 数据");
+}
+
 export class WeixinBotDO extends DurableObject<Env> {
   private pollInFlight?: Promise<PollResult>;
   private lastStorageAlertAt = 0;
@@ -225,14 +262,31 @@ export class WeixinBotDO extends DurableObject<Env> {
     )`);
     this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC)");
     this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_pending ON messages(direction, status, created_at)");
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS media_objects (
+      media_ref TEXT PRIMARY KEY,
+      message_ref TEXT NOT NULL,
+      item_index INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      chunk_count INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    )`);
+    this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_media_message ON media_objects(message_ref, item_index)");
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS media_chunks (
+      media_ref TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      PRIMARY KEY(media_ref, chunk_index)
+    )`);
   }
 
   private async account(): Promise<WeixinAccountState | undefined> {
     return this.ctx.storage.get<WeixinAccountState>(ACCOUNT_KEY);
   }
 
-  private async alertStorageFull(error: unknown): Promise<void> {
-    if (!isStorageFullError(error)) return;
+  private async alertText(text: string): Promise<void> {
     const now = Date.now();
     if (now - this.lastStorageAlertAt < STORAGE_ALERT_COOLDOWN_MS) return;
     this.lastStorageAlertAt = now;
@@ -244,11 +298,16 @@ export class WeixinBotDO extends DurableObject<Env> {
         token: account.token,
         toUserId: account.userId,
         contextToken: account.contextToken,
-        text: "微信 MCP 存储空间已满，新的历史记录或媒体文件可能无法保存。请打开 /admin 删除不需要的消息或媒体后再试。",
+        text,
       });
     } catch (alertError) {
       console.error("WeixinBotDO storage alert failed:", errorMessage(alertError));
     }
+  }
+
+  private async alertStorageFull(error: unknown): Promise<void> {
+    if (!isStorageFullError(error)) return;
+    await this.alertText("微信 MCP 存储空间已满，新的历史记录或媒体文件可能无法保存。请打开 /admin 删除不需要的消息或媒体后再试。");
   }
 
   private async login(): Promise<LoginSessionState | undefined> {
@@ -324,12 +383,21 @@ export class WeixinBotDO extends DurableObject<Env> {
     return { success: true, removed: id };
   }
 
+  private mediaUsage() {
+    this.ensureSchema();
+    const row = this.ctx.storage.sql.exec<{ count: number; bytes: number }>(
+      "SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes),0) AS bytes FROM media_objects",
+    ).toArray()[0];
+    return { count: Number(row?.count || 0), bytes: Number(row?.bytes || 0) };
+  }
+
   private async status() {
     this.ensureSchema();
     const [account, login, sync] = await Promise.all([this.account(), this.login(), this.syncState()]);
     const counts = this.ctx.storage.sql.exec<{ total: number; pending: number }>(
       "SELECT COUNT(*) AS total, SUM(CASE WHEN direction='inbound' AND status='pending' THEN 1 ELSE 0 END) AS pending FROM messages",
     ).toArray()[0];
+    const media = this.mediaUsage();
     return {
       connected: Boolean(account?.token && account?.userId),
       botId: maskId(account?.botId),
@@ -340,6 +408,10 @@ export class WeixinBotDO extends DurableObject<Env> {
       hasContextToken: Boolean(account?.contextToken),
       messageCount: Number(counts?.total || 0),
       pendingInbound: Number(counts?.pending || 0),
+      mediaCount: media.count,
+      mediaBytes: media.bytes,
+      mediaSoftQuotaBytes: MEDIA_SOFT_QUOTA_BYTES,
+      mediaSingleFileLimitBytes: MAX_MEDIA_BYTES,
       lastPollAt: sync.lastPollAt || null,
       lastPollReceived: sync.lastPollReceived ?? null,
       lastPollTimedOut: sync.lastPollTimedOut ?? null,
@@ -369,12 +441,7 @@ export class WeixinBotDO extends DurableObject<Env> {
       status: "wait",
     };
     await this.ctx.storage.put(LOGIN_KEY, login);
-    return {
-      sessionId: login.sessionId,
-      qrcodeUrl: login.qrcodeUrl,
-      expiresAt: new Date(login.startedAt + LOGIN_TTL_MS).toISOString(),
-      status: login.status,
-    };
+    return { sessionId: login.sessionId, qrcodeUrl: login.qrcodeUrl, expiresAt: new Date(login.startedAt + LOGIN_TTL_MS).toISOString(), status: login.status };
   }
 
   private async pollLogin(sessionId: string, verifyCode?: string) {
@@ -387,7 +454,6 @@ export class WeixinBotDO extends DurableObject<Env> {
     if (verifyCode?.trim()) login.pendingVerifyCode = verifyCode.trim();
     const result = await pollLoginStatus(this.env, login.currentBaseUrl, login.qrcode, login.pendingVerifyCode);
     login.status = result.status;
-
     if (result.status === "scaned_but_redirect") {
       if (!result.redirect_host) throw new Error("微信要求切换节点，但未返回 redirect_host");
       login.currentBaseUrl = normalizeIlinkBaseUrl(result.redirect_host);
@@ -415,9 +481,7 @@ export class WeixinBotDO extends DurableObject<Env> {
       throw new Error("微信提示该 ClawBot 已绑定，但当前用户没有本地凭证；请重新绑定");
     }
     if (result.status === "confirmed") {
-      if (!result.bot_token || !result.ilink_bot_id || !result.ilink_user_id) {
-        throw new Error("微信确认成功，但未返回完整 bot_token / bot_id / user_id");
-      }
+      if (!result.bot_token || !result.ilink_bot_id || !result.ilink_user_id) throw new Error("微信确认成功，但未返回完整 bot_token / bot_id / user_id");
       const account: WeixinAccountState = {
         token: result.bot_token,
         botId: result.ilink_bot_id,
@@ -460,6 +524,70 @@ export class WeixinBotDO extends DurableObject<Env> {
     );
   }
 
+  private saveMedia(messageRef: string, media: { kind: "image" | "voice" | "file" | "video"; mimeType: string; fileName: string; bytes: Uint8Array; itemIndex: number }): StoredMediaDescriptor {
+    this.ensureSchema();
+    if (media.bytes.byteLength > MAX_MEDIA_BYTES) throw new Error(`媒体文件超过当前 ${Math.floor(MAX_MEDIA_BYTES / 1024 / 1024)}MB 上限`);
+    const usage = this.mediaUsage();
+    if (usage.bytes + media.bytes.byteLength > MEDIA_SOFT_QUOTA_BYTES) {
+      throw new Error(`媒体存储达到软上限 ${Math.floor(MEDIA_SOFT_QUOTA_BYTES / 1024 / 1024)}MB，请先清理历史媒体`);
+    }
+    const mediaRef = `media_${crypto.randomUUID().replace(/-/g, "")}`;
+    const createdAt = new Date().toISOString();
+    const chunkCount = Math.ceil(media.bytes.byteLength / MEDIA_CHUNK_BYTES);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO media_objects(media_ref,message_ref,item_index,kind,mime_type,file_name,size_bytes,chunk_count,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        mediaRef, messageRef, media.itemIndex, media.kind, media.mimeType,
+        sanitizeFileName(media.fileName, `${media.kind}.bin`), media.bytes.byteLength, chunkCount, createdAt,
+      );
+      for (let i = 0; i < chunkCount; i += 1) {
+        const start = i * MEDIA_CHUNK_BYTES;
+        const chunk = media.bytes.slice(start, Math.min(start + MEDIA_CHUNK_BYTES, media.bytes.byteLength));
+        this.ctx.storage.sql.exec("INSERT INTO media_chunks(media_ref,chunk_index,data) VALUES(?,?,?)", mediaRef, i, chunk.slice().buffer as ArrayBuffer);
+      }
+    });
+    return {
+      mediaRef,
+      kind: media.kind,
+      mimeType: media.mimeType,
+      fileName: sanitizeFileName(media.fileName, `${media.kind}.bin`),
+      sizeBytes: media.bytes.byteLength,
+      itemIndex: media.itemIndex,
+      createdAt,
+    };
+  }
+
+  private async persistInboundMedia(messageRef: string, message: WeixinMessage): Promise<{ media: StoredMediaDescriptor[]; errors: string[] }> {
+    const saved: StoredMediaDescriptor[] = [];
+    const errors: string[] = [];
+    const items = message.item_list || [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      if (![2, 3, 4, 5].includes(item.type || 0)) continue;
+      try {
+        const downloaded = await downloadInboundMedia(item, index);
+        if (!downloaded) {
+          errors.push(`第 ${index + 1} 个媒体项缺少可下载的微信 CDN 引用`);
+          continue;
+        }
+        saved.push(this.saveMedia(messageRef, downloaded));
+      } catch (error) {
+        const detail = errorMessage(error);
+        errors.push(`第 ${index + 1} 个媒体项保存失败：${detail}`);
+        if (/媒体存储达到软上限/.test(detail)) {
+          await this.alertText("微信 MCP 的媒体存储已接近 750MB 安全上限，新媒体将暂不保存。请打开 /admin 清理旧媒体后再试。");
+        } else {
+          await this.alertStorageFull(error);
+        }
+      }
+    }
+    return { media: saved, errors };
+  }
+
+  private updateMessageMetadata(messageRef: string, metadata: Record<string, unknown>) {
+    this.ctx.storage.sql.exec("UPDATE messages SET metadata_json=? WHERE message_ref=?", JSON.stringify(metadata), messageRef);
+  }
+
   private async send(text: string) {
     const account = await this.account();
     if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先在 /admin 完成扫码绑定");
@@ -486,12 +614,112 @@ export class WeixinBotDO extends DurableObject<Env> {
       });
       return { success: true, messageRef: ref, recipient: maskId(account.userId), usedContextToken: Boolean(account.contextToken), chunks: chunks.length, messageIds };
     } catch (error) {
-      this.insertHistory({
-        message_ref: ref, source_id: null, direction: "outbound", kind: "text", text,
-        status: "failed", context_token: null, from_user_id: null, created_at: new Date().toISOString(),
-        replied_at: null, reply_to: null, metadata_json: JSON.stringify({ chunks: chunks.length }),
-        external_ids_json: JSON.stringify(messageIds), error: errorMessage(error),
+      try {
+        this.insertHistory({
+          message_ref: ref, source_id: null, direction: "outbound", kind: "text", text,
+          status: "failed", context_token: null, from_user_id: null, created_at: new Date().toISOString(),
+          replied_at: null, reply_to: null, metadata_json: JSON.stringify({ chunks: chunks.length }),
+          external_ids_json: JSON.stringify(messageIds), error: errorMessage(error),
+        });
+      } catch (historyError) {
+        await this.alertStorageFull(historyError);
+      }
+      throw error;
+    }
+  }
+
+  private async sendMedia(body: Record<string, unknown>) {
+    const account = await this.account();
+    if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先在 /admin 完成扫码绑定");
+    const kind = String(body.kind || "") as SendableMediaKind;
+    if (!(["image", "file", "video"] as string[]).includes(kind)) throw new Error("kind 只支持 image / file / video");
+    const dataBase64 = String(body.dataBase64 || "").trim();
+    if (!dataBase64) throw new Error("缺少 dataBase64");
+    const bytes = new Uint8Array(Buffer.from(dataBase64, "base64"));
+    if (!bytes.byteLength) throw new Error("媒体内容为空或 base64 无效");
+    if (bytes.byteLength > MAX_MEDIA_BYTES) throw new Error(`媒体文件超过当前 ${Math.floor(MAX_MEDIA_BYTES / 1024 / 1024)}MB 上限`);
+    const fileName = sanitizeFileName(String(body.fileName || ""), kind === "image" ? "image.jpg" : kind === "video" ? "video.mp4" : "file.bin");
+    const mimeType = String(body.mimeType || "application/octet-stream").trim().slice(0, 120) || "application/octet-stream";
+    const caption = String(body.caption || "").trim();
+    const outboundRef = `out_${crypto.randomUUID().replace(/-/g, "")}`;
+    const messageIds: string[] = [];
+    try {
+      if (caption) {
+        const captions = splitText(caption);
+        if (captions.length > 20) throw new Error("caption 过长");
+        for (const chunk of captions) {
+          messageIds.push(await sendTextMessage(this.env, {
+            baseUrl: account.baseUrl,
+            token: account.token,
+            toUserId: account.userId,
+            text: chunk,
+            contextToken: account.contextToken,
+          }));
+        }
+      }
+      const uploaded = await uploadMediaBuffer(this.env, {
+        baseUrl: account.baseUrl,
+        token: account.token,
+        toUserId: account.userId,
+        kind,
+        bytes,
       });
+      messageIds.push(await sendUploadedMediaMessage(this.env, {
+        baseUrl: account.baseUrl,
+        token: account.token,
+        toUserId: account.userId,
+        kind,
+        uploaded,
+        fileName,
+        contextToken: account.contextToken,
+      }));
+      const createdAt = new Date().toISOString();
+      const metadata: Record<string, unknown> = { caption: caption || null };
+      let historyWarning: string | null = null;
+      try {
+        this.insertHistory({
+          message_ref: outboundRef, source_id: null, direction: "outbound", kind,
+          text: caption || (kind === "image" ? "[图片]" : kind === "video" ? "[视频]" : `[文件] ${fileName}`),
+          status: "sent", context_token: null, from_user_id: null, created_at: createdAt,
+          replied_at: null, reply_to: null, metadata_json: JSON.stringify(metadata),
+          external_ids_json: JSON.stringify(messageIds), error: null,
+        });
+        try {
+          const descriptor = this.saveMedia(outboundRef, { kind, mimeType, fileName, bytes, itemIndex: 0 });
+          metadata.media = [descriptor];
+          this.updateMessageMetadata(outboundRef, metadata);
+        } catch (mediaError) {
+          historyWarning = errorMessage(mediaError);
+          metadata.mediaErrors = [historyWarning];
+          this.updateMessageMetadata(outboundRef, metadata);
+          if (/媒体存储达到软上限/.test(historyWarning)) await this.alertText("微信 MCP 的媒体存储已接近 750MB 安全上限，本次媒体已发送但未保存副本。请在 /admin 清理旧媒体。");
+          else await this.alertStorageFull(mediaError);
+        }
+      } catch (historyError) {
+        historyWarning = errorMessage(historyError);
+        await this.alertStorageFull(historyError);
+      }
+      return {
+        success: true,
+        messageRef: outboundRef,
+        kind,
+        fileName,
+        sizeBytes: bytes.byteLength,
+        messageIds,
+        historyWarning,
+      };
+    } catch (error) {
+      try {
+        this.insertHistory({
+          message_ref: outboundRef, source_id: null, direction: "outbound", kind,
+          text: caption || `[${kind}] ${fileName}`, status: "failed", context_token: null, from_user_id: null,
+          created_at: new Date().toISOString(), replied_at: null, reply_to: null,
+          metadata_json: JSON.stringify({ caption: caption || null, fileName, mimeType, sizeBytes: bytes.byteLength }),
+          external_ids_json: JSON.stringify(messageIds), error: errorMessage(error),
+        });
+      } catch (historyError) {
+        await this.alertStorageFull(historyError);
+      }
       throw error;
     }
   }
@@ -532,6 +760,7 @@ export class WeixinBotDO extends DurableObject<Env> {
           if (existing) continue;
           const createTimeMs = typeof message.create_time_ms === "number" && Number.isFinite(message.create_time_ms) ? message.create_time_ms : undefined;
           const messageRef = `wxmsg_${crypto.randomUUID().replace(/-/g, "")}`;
+          const metadata = safeMediaMetadata(message);
           this.insertHistory({
             message_ref: messageRef,
             source_id: id,
@@ -544,10 +773,14 @@ export class WeixinBotDO extends DurableObject<Env> {
             created_at: createTimeMs ? new Date(createTimeMs).toISOString() : now,
             replied_at: null,
             reply_to: null,
-            metadata_json: JSON.stringify(safeMediaMetadata(message)),
+            metadata_json: JSON.stringify(metadata),
             external_ids_json: null,
             error: null,
           });
+          const persisted = await this.persistInboundMedia(messageRef, message);
+          if (persisted.media.length) metadata.media = persisted.media;
+          if (persisted.errors.length) metadata.mediaErrors = persisted.errors;
+          if (persisted.media.length || persisted.errors.length) this.updateMessageMetadata(messageRef, metadata);
           received += 1;
           if (message.context_token) account.contextToken = message.context_token;
           account.lastInboundAt = now;
@@ -580,9 +813,7 @@ export class WeixinBotDO extends DurableObject<Env> {
   }
 
   private async poll(limit: number): Promise<PollResult> {
-    if (!this.pollInFlight) {
-      this.pollInFlight = this.performPoll(limit).finally(() => { this.pollInFlight = undefined; });
-    }
+    if (!this.pollInFlight) this.pollInFlight = this.performPoll(limit).finally(() => { this.pollInFlight = undefined; });
     return this.pollInFlight;
   }
 
@@ -622,12 +853,16 @@ export class WeixinBotDO extends DurableObject<Env> {
       return { success: true, alreadyReplied: false, messageRef, outboundMessageRef: outboundRef, chunks: chunks.length, messageIds, repliedAt };
     } catch (error) {
       this.ctx.storage.sql.exec("UPDATE messages SET error=? WHERE message_ref=?", errorMessage(error), messageRef);
-      this.insertHistory({
-        message_ref: outboundRef, source_id: null, direction: "outbound", kind: "text", text,
-        status: "failed", context_token: null, from_user_id: null, created_at: new Date().toISOString(),
-        replied_at: null, reply_to: messageRef, metadata_json: JSON.stringify({ chunks: chunks.length }),
-        external_ids_json: JSON.stringify(messageIds), error: errorMessage(error),
-      });
+      try {
+        this.insertHistory({
+          message_ref: outboundRef, source_id: null, direction: "outbound", kind: "text", text,
+          status: "failed", context_token: null, from_user_id: null, created_at: new Date().toISOString(),
+          replied_at: null, reply_to: messageRef, metadata_json: JSON.stringify({ chunks: chunks.length }),
+          external_ids_json: JSON.stringify(messageIds), error: errorMessage(error),
+        });
+      } catch (historyError) {
+        await this.alertStorageFull(historyError);
+      }
       throw error;
     }
   }
@@ -639,22 +874,62 @@ export class WeixinBotDO extends DurableObject<Env> {
     return { total: Number(count?.count || 0), limit, offset, messages: rows.map(publicRow) };
   }
 
+  private readMedia(mediaRef: string): { row: MediaRow; bytes: Uint8Array } {
+    this.ensureSchema();
+    const row = this.ctx.storage.sql.exec<MediaRow>("SELECT * FROM media_objects WHERE media_ref=? LIMIT 1", mediaRef).toArray()[0];
+    if (!row) throw new Error("媒体不存在或已被删除");
+    const chunks = this.ctx.storage.sql.exec<MediaChunkRow>("SELECT data FROM media_chunks WHERE media_ref=? ORDER BY chunk_index ASC", mediaRef).toArray();
+    if (chunks.length !== Number(row.chunk_count)) throw new Error("媒体分片不完整");
+    const output = new Uint8Array(Number(row.size_bytes));
+    let offset = 0;
+    for (const chunkRow of chunks) {
+      const chunk = binaryFromSql(chunkRow.data);
+      output.set(chunk.subarray(0, Math.min(chunk.length, output.length - offset)), offset);
+      offset += chunk.length;
+    }
+    if (offset < output.length) throw new Error("媒体数据长度不足");
+    return { row, bytes: output };
+  }
+
+  private mediaHttpResponse(mediaRef: string): Response {
+    const { row, bytes } = this.readMedia(mediaRef);
+    const fileName = sanitizeFileName(row.file_name, "media.bin");
+    return new Response(bytes.slice().buffer as ArrayBuffer, {
+      headers: {
+        "content-type": row.mime_type || "application/octet-stream",
+        "content-length": String(bytes.byteLength),
+        "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+        "cache-control": "private, max-age=3600",
+        "x-weixin-media-kind": row.kind,
+        "x-weixin-media-ref": row.media_ref,
+      },
+    });
+  }
+
   private deleteMessage(messageRef: string) {
     this.ensureSchema();
-    this.ctx.storage.sql.exec("DELETE FROM messages WHERE message_ref=?", messageRef);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM media_chunks WHERE media_ref IN (SELECT media_ref FROM media_objects WHERE message_ref=?)", messageRef);
+      this.ctx.storage.sql.exec("DELETE FROM media_objects WHERE message_ref=?", messageRef);
+      this.ctx.storage.sql.exec("DELETE FROM messages WHERE message_ref=?", messageRef);
+    });
     return { success: true, deleted: messageRef };
   }
 
   private clearMessages() {
     this.ensureSchema();
-    this.ctx.storage.sql.exec("DELETE FROM messages");
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM media_chunks");
+      this.ctx.storage.sql.exec("DELETE FROM media_objects");
+      this.ctx.storage.sql.exec("DELETE FROM messages");
+    });
     return { success: true };
   }
 
   private async reset() {
     this.ensureSchema();
     await this.ctx.storage.delete([ACCOUNT_KEY, LOGIN_KEY, SYNC_KEY]);
-    this.ctx.storage.sql.exec("DELETE FROM messages");
+    this.clearMessages();
     return { success: true };
   }
 
@@ -668,9 +943,13 @@ export class WeixinBotDO extends DurableObject<Env> {
         const offset = Math.max(0, Number.parseInt(url.searchParams.get("offset") || "0", 10) || 0);
         return json(this.listMessages(limit, offset));
       }
+      if (request.method === "GET" && url.pathname.startsWith("/media/")) {
+        const mediaRef = decodeURIComponent(url.pathname.slice("/media/".length));
+        if (!mediaRef) throw new Error("缺少 mediaRef");
+        return this.mediaHttpResponse(mediaRef);
+      }
       if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
       const body = await request.json().catch(() => ({})) as Record<string, unknown>;
-
       if (url.pathname === "/registry/create") return json(await this.registryCreate(body));
       if (url.pathname === "/registry/update") return json(await this.registryUpdate(body));
       if (url.pathname === "/registry/remove") return json(await this.registryRemove(body));
@@ -681,6 +960,7 @@ export class WeixinBotDO extends DurableObject<Env> {
         return json(await this.pollLogin(sessionId, typeof body.verifyCode === "string" ? body.verifyCode : undefined));
       }
       if (url.pathname === "/send") return json(await this.send(String(body.text || "")));
+      if (url.pathname === "/send-media") return json(await this.sendMedia(body));
       if (url.pathname === "/poll") {
         const requested = Number(body.limit || 20);
         const limit = Number.isFinite(requested) ? Math.min(50, Math.max(1, Math.trunc(requested))) : 20;
