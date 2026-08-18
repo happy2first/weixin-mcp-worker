@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "weixin-mcp-worker",
-  "main": "src/index.ts",
+  "main": "src/index-v05.ts",
   "compatibility_date": "2026-08-17",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
