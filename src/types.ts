@@ -1,4 +1,4 @@
-import type { DurableObjectNamespace } from "@cloudflare/workers-types";
+import type { DurableObjectNamespace } from "cloudflare:workers";
 
 export interface Env {
   WEIXIN_BOT: DurableObjectNamespace;

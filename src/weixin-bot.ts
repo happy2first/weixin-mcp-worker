@@ -70,7 +70,7 @@ type MediaRow = {
   created_at: string;
 };
 
-type MediaChunkRow = { data: unknown };
+type MediaChunkRow = { data: ArrayBuffer };
 
 type PollResult = {
   success: true;
