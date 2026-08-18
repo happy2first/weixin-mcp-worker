@@ -1,0 +1,165 @@
+name: One-shot v0.5 retention upgrade
+
+on:
+  push:
+    paths:
+      - '.github/workflows/one-shot-v05-retention.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply retention upgrade
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              if old not in text:
+                  raise SystemExit(f'expected marker not found: {label}')
+              return text.replace(old, new, 1)
+
+          # package version
+          p = Path('package.json')
+          s = p.read_text()
+          s = replace_once(s, '"version": "0.4.0"', '"version": "0.5.0"', 'package version')
+          p.write_text(s)
+
+          # iLink agent version
+          p = Path('src/ilink.ts')
+          s = p.read_text()
+          s = replace_once(s, 'const BOT_AGENT = "weixin-mcp-worker/0.4.0";', 'const BOT_AGENT = "weixin-mcp-worker/0.5.0";', 'bot agent version')
+          p.write_text(s)
+
+          # Worker routes/version/admin API
+          p = Path('src/index.ts')
+          s = p.read_text()
+          s = replace_once(s, 'const VERSION = "0.4.0";', 'const VERSION = "0.5.0";', 'worker version')
+          s = replace_once(s, '    if (url.pathname === "/setup") return Response.redirect(new URL("/admin", request.url).toString(), 308);\n', '', 'remove setup route')
+          marker = '''  if (pathname === "/admin/api/messages/clear") {\n    const userId = normalizeProfileId(body.userId);\n    return Response.json(await callUser(env, userId, "/messages/clear", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));\n  }'''
+          replacement = marker + '''\n  if (pathname === "/admin/api/retention") {\n    const userId = normalizeProfileId(body.userId);\n    return Response.json(await callUser(env, userId, "/retention", {\n      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limitMB: body.limitMB }),\n    }));\n  }'''
+          s = replace_once(s, marker, replacement, 'admin retention endpoint')
+          p.write_text(s)
+
+          # Durable Object retention logic
+          p = Path('src/weixin-bot.ts')
+          s = p.read_text()
+          s = replace_once(
+              s,
+              'const STORAGE_ALERT_COOLDOWN_MS = 6 * 60 * 60_000;\n',
+              '''const STORAGE_ALERT_COOLDOWN_MS = 6 * 60 * 60_000;\nconst RETENTION_KEY = "retention";\nconst DEFAULT_RETENTION_LIMIT_BYTES = MEDIA_SOFT_QUOTA_BYTES;\nconst RETENTION_TARGET_RATIO = 0.9;\nconst MIN_RETENTION_LIMIT_BYTES = 50 * 1024 * 1024;\nconst MAX_RETENTION_LIMIT_BYTES = 900 * 1024 * 1024;\n\ntype RetentionState = {\n  limitBytes: number;\n  updatedAt?: string;\n  lastCleanupAt?: string;\n  totalDeletedMessages?: number;\n  totalDeletedMediaBytes?: number;\n};\n''',
+              'retention constants',
+          )
+
+          media_usage_marker = '''  private mediaUsage() {\n    this.ensureSchema();\n    const row = this.ctx.storage.sql.exec<{ count: number; bytes: number }>(\n      "SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes),0) AS bytes FROM media_objects",\n    ).toArray()[0];\n    return { count: Number(row?.count || 0), bytes: Number(row?.bytes || 0) };\n  }\n'''
+          retention_methods = media_usage_marker + '''\n  private async retentionState(): Promise<RetentionState> {\n    const stored = await this.ctx.storage.get<RetentionState>(RETENTION_KEY);\n    const limit = Number(stored?.limitBytes || DEFAULT_RETENTION_LIMIT_BYTES);\n    return {\n      ...(stored || {}),\n      limitBytes: Number.isFinite(limit)\n        ? Math.min(MAX_RETENTION_LIMIT_BYTES, Math.max(MIN_RETENTION_LIMIT_BYTES, Math.trunc(limit)))\n        : DEFAULT_RETENTION_LIMIT_BYTES,\n    };\n  }\n\n  private historyUsage() {\n    this.ensureSchema();\n    const messageRow = this.ctx.storage.sql.exec<{ bytes: number }>(`\n      SELECT COALESCE(SUM(\n        LENGTH(CAST(COALESCE(text,'') AS BLOB)) +\n        LENGTH(CAST(COALESCE(metadata_json,'') AS BLOB)) +\n        LENGTH(CAST(COALESCE(external_ids_json,'') AS BLOB)) +\n        LENGTH(CAST(COALESCE(error,'') AS BLOB)) + 512\n      ),0) AS bytes FROM messages\n    `).toArray()[0];\n    const mediaRow = this.ctx.storage.sql.exec<{ count: number; bytes: number; chunks: number }>(\n      "SELECT COUNT(*) AS count, COALESCE(SUM(size_bytes),0) AS bytes, COALESCE(SUM(chunk_count),0) AS chunks FROM media_objects",\n    ).toArray()[0];\n    const messageBytes = Number(messageRow?.bytes || 0);\n    const mediaBytes = Number(mediaRow?.bytes || 0);\n    const mediaOverhead = Number(mediaRow?.count || 0) * 256 + Number(mediaRow?.chunks || 0) * 128;\n    return {\n      messageBytes,\n      mediaBytes,\n      historyBytes: messageBytes + mediaBytes + mediaOverhead,\n      databaseBytes: Number(this.ctx.storage.sql.databaseSize || 0),\n    };\n  }\n\n  private deleteMessageBatch(messageRefs: string[]): void {\n    if (!messageRefs.length) return;\n    const placeholders = messageRefs.map(() => "?").join(",");\n    this.ctx.storage.transactionSync(() => {\n      this.ctx.storage.sql.exec(\n        `DELETE FROM media_chunks WHERE media_ref IN (SELECT media_ref FROM media_objects WHERE message_ref IN (${placeholders}))`,\n        ...messageRefs,\n      );\n      this.ctx.storage.sql.exec(`DELETE FROM media_objects WHERE message_ref IN (${placeholders})`, ...messageRefs);\n      this.ctx.storage.sql.exec(`DELETE FROM messages WHERE message_ref IN (${placeholders})`, ...messageRefs);\n    });\n  }\n\n  private async notifyRetentionCleanup(summary: { deletedMessages: number; deletedMediaBytes: number; afterBytes: number; limitBytes: number }): Promise<void> {\n    try {\n      const account = await this.account();\n      if (!account?.token || !account.userId) return;\n      const mb = (value: number) => (value / 1024 / 1024).toFixed(1);\n      await sendTextMessage(this.env, {\n        baseUrl: account.baseUrl, token: account.token, toUserId: account.userId, contextToken: account.contextToken,\n        text: `微信 MCP 已自动清理历史数据：删除 ${summary.deletedMessages} 条较早消息及其附件，附件约 ${mb(summary.deletedMediaBytes)} MB。当前保留数据约 ${mb(summary.afterBytes)} MB，配置上限 ${mb(summary.limitBytes)} MB。待处理的微信消息不会被自动删除。`,\n      });\n    } catch (error) {\n      console.error("WeixinBotDO retention notification failed:", errorMessage(error));\n    }\n  }\n\n  private async enforceRetention() {\n    const retention = await this.retentionState();\n    let usage = this.historyUsage();\n    const beforeBytes = usage.historyBytes;\n    if (beforeBytes <= retention.limitBytes) {\n      return { pruned: false, beforeBytes, afterBytes: beforeBytes, limitBytes: retention.limitBytes, deletedMessages: 0, deletedMediaBytes: 0 };\n    }\n    const targetBytes = Math.floor(retention.limitBytes * RETENTION_TARGET_RATIO);\n    let deletedMessages = 0;\n    let deletedMediaBytes = 0;\n    for (let cycle = 0; cycle < 50 && usage.historyBytes > targetBytes; cycle += 1) {\n      const rows = this.ctx.storage.sql.exec<{ message_ref: string; media_bytes: number }>(`\n        SELECT m.message_ref AS message_ref, COALESCE(SUM(mo.size_bytes),0) AS media_bytes\n        FROM messages m LEFT JOIN media_objects mo ON mo.message_ref=m.message_ref\n        WHERE NOT (m.direction='inbound' AND m.status='pending')\n        GROUP BY m.message_ref\n        ORDER BY m.created_at ASC\n        LIMIT 20\n      `).toArray();\n      if (!rows.length) break;\n      const refs = rows.map((row) => row.message_ref);\n      deletedMessages += refs.length;\n      deletedMediaBytes += rows.reduce((sum, row) => sum + Number(row.media_bytes || 0), 0);\n      this.deleteMessageBatch(refs);\n      usage = this.historyUsage();\n      if (rows.length < 20) break;\n    }\n    if (deletedMessages > 0) {\n      const now = new Date().toISOString();\n      retention.lastCleanupAt = now;\n      retention.totalDeletedMessages = Number(retention.totalDeletedMessages || 0) + deletedMessages;\n      retention.totalDeletedMediaBytes = Number(retention.totalDeletedMediaBytes || 0) + deletedMediaBytes;\n      await this.ctx.storage.put(RETENTION_KEY, retention);\n      await this.notifyRetentionCleanup({\n        deletedMessages, deletedMediaBytes, afterBytes: usage.historyBytes, limitBytes: retention.limitBytes,\n      });\n    }\n    return {\n      pruned: deletedMessages > 0, beforeBytes, afterBytes: usage.historyBytes, limitBytes: retention.limitBytes,\n      targetBytes, deletedMessages, deletedMediaBytes,\n      pendingProtected: usage.historyBytes > retention.limitBytes && deletedMessages === 0,\n    };\n  }\n\n  private async safeEnforceRetention() {\n    try { return await this.enforceRetention(); }\n    catch (error) {\n      console.error("WeixinBotDO retention check failed:", errorMessage(error));\n      return { pruned: false, error: errorMessage(error) };\n    }\n  }\n\n  private async setRetention(body: Record<string, unknown>) {\n    const limitMB = Number(body.limitMB);\n    if (!Number.isFinite(limitMB)) throw new Error("历史数据保留上限必须是数字");\n    const limitBytes = Math.round(limitMB * 1024 * 1024);\n    if (limitBytes < MIN_RETENTION_LIMIT_BYTES || limitBytes > MAX_RETENTION_LIMIT_BYTES) {\n      throw new Error("历史数据保留上限范围为 50-900 MB/用户");\n    }\n    const retention = await this.retentionState();\n    retention.limitBytes = limitBytes;\n    retention.updatedAt = new Date().toISOString();\n    await this.ctx.storage.put(RETENTION_KEY, retention);\n    const cleanup = await this.safeEnforceRetention();\n    return { success: true, retention: await this.retentionState(), usage: this.historyUsage(), cleanup };\n  }\n'''
+          s = replace_once(s, media_usage_marker, retention_methods, 'retention methods')
+
+          old_status = '''    const media = this.mediaUsage();\n    return {\n      connected: Boolean(account?.token && account?.userId),'''
+          new_status = '''    const media = this.mediaUsage();\n    const retention = await this.retentionState();\n    const history = this.historyUsage();\n    return {\n      connected: Boolean(account?.token && account?.userId),'''
+          s = replace_once(s, old_status, new_status, 'status retention prelude')
+          s = replace_once(
+              s,
+              '''      mediaCount: media.count,\n      mediaBytes: media.bytes,\n      mediaSoftQuotaBytes: MEDIA_SOFT_QUOTA_BYTES,\n      mediaSingleFileLimitBytes: MAX_MEDIA_BYTES,''',
+              '''      mediaCount: media.count,\n      mediaBytes: media.bytes,\n      mediaSoftQuotaBytes: retention.limitBytes,\n      mediaSingleFileLimitBytes: MAX_MEDIA_BYTES,\n      historyBytes: history.historyBytes,\n      databaseBytes: history.databaseBytes,\n      historyLimitBytes: retention.limitBytes,\n      historyTargetBytes: Math.floor(retention.limitBytes * RETENTION_TARGET_RATIO),\n      retentionLastCleanupAt: retention.lastCleanupAt || null,\n      retentionDeletedMessages: Number(retention.totalDeletedMessages || 0),\n      retentionDeletedMediaBytes: Number(retention.totalDeletedMediaBytes || 0),''',
+              'status retention fields',
+          )
+
+          old_quota = '''    const usage = this.mediaUsage();\n    if (usage.bytes + media.bytes.byteLength > MEDIA_SOFT_QUOTA_BYTES) {\n      throw new Error(`媒体存储达到软上限 ${Math.floor(MEDIA_SOFT_QUOTA_BYTES / 1024 / 1024)}MB，请先清理历史媒体`);\n    }\n'''
+          s = replace_once(s, old_quota, '', 'remove old media quota rejection')
+
+          # Run cleanup after successful writes.
+          s = replace_once(
+              s,
+              '''      return { success: true, messageRef: ref, recipient: maskId(account.userId), usedContextToken: Boolean(account.contextToken), chunks: chunks.length, messageIds };''',
+              '''      const retentionCleanup = await this.safeEnforceRetention();\n      return { success: true, messageRef: ref, recipient: maskId(account.userId), usedContextToken: Boolean(account.contextToken), chunks: chunks.length, messageIds, retentionCleanup };''',
+              'text send cleanup',
+          )
+          s = replace_once(
+              s,
+              '''      return {\n        success: true,\n        messageRef: outboundRef,\n        kind,\n        fileName,\n        sizeBytes: bytes.byteLength,\n        messageIds,\n        historyWarning,\n      };''',
+              '''      const retentionCleanup = await this.safeEnforceRetention();\n      return {\n        success: true,\n        messageRef: outboundRef,\n        kind,\n        fileName,\n        sizeBytes: bytes.byteLength,\n        messageIds,\n        historyWarning,\n        retentionCleanup,\n      };''',
+              'media send cleanup',
+          )
+          s = replace_once(
+              s,
+              '''      return { success: true, alreadyReplied: false, messageRef, outboundMessageRef: outboundRef, chunks: chunks.length, messageIds, repliedAt };''',
+              '''      const retentionCleanup = await this.safeEnforceRetention();\n      return { success: true, alreadyReplied: false, messageRef, outboundMessageRef: outboundRef, chunks: chunks.length, messageIds, repliedAt, retentionCleanup };''',
+              'reply cleanup',
+          )
+          poll_marker = '''    const pending = this.pendingMessages(limit);\n    const count = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM messages WHERE direction='inbound' AND status='pending'").toArray()[0];'''
+          poll_replacement = '''    await this.safeEnforceRetention();\n    const pending = this.pendingMessages(limit);\n    const count = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM messages WHERE direction='inbound' AND status='pending'").toArray()[0];'''
+          s = replace_once(s, poll_marker, poll_replacement, 'poll cleanup')
+
+          # Internal retention API.
+          s = replace_once(
+              s,
+              '''      if (request.method === "GET" && url.pathname === "/status") return json(await this.status());''',
+              '''      if (request.method === "GET" && url.pathname === "/status") return json(await this.status());\n      if (request.method === "GET" && url.pathname === "/retention") return json({ retention: await this.retentionState(), usage: this.historyUsage() });''',
+              'retention GET route',
+          )
+          s = replace_once(
+              s,
+              '''      if (url.pathname === "/messages/clear") return json(this.clearMessages());\n      if (url.pathname === "/reset") return json(await this.reset());''',
+              '''      if (url.pathname === "/messages/clear") return json(this.clearMessages());\n      if (url.pathname === "/retention") return json(await this.setRetention(body));\n      if (url.pathname === "/reset") return json(await this.reset());''',
+              'retention POST route',
+          )
+          p.write_text(s)
+
+          # Admin UI
+          p = Path('src/setup-page.ts')
+          s = p.read_text()
+          s = replace_once(s, '<span class="tag blue">v0.4</span>', '<span class="tag blue">v0.5</span>', 'admin version label')
+          settings_marker = '<section class="section" id="section-settings">'
+          if settings_marker not in s:
+              raise SystemExit('settings section marker not found')
+          retention_card = '''<div class="card" style="margin-bottom:16px"><div class="cardTitle"><h2>历史数据自动保留</h2><span class="tag blue">自动清理</span></div><div class="notice">Cloudflare Workers Free 的 SQLite-backed Durable Objects 当前为账号合计 5 GB。本系统默认每个微信用户保留 750 MB 交互历史；达到配置上限后会自动删除最旧的已处理消息及其附件，清理至约 90%，完成后通过 ClawBot 通知。尚未处理的微信消息不会被自动删除。</div><div id="retentionSettings" class="settingsList" style="margin-top:14px"></div></div>'''
+          s = s.replace(settings_marker, settings_marker + retention_card, 1)
+
+          old_load = '''async function loadUsers(){var data=await api('/users');state.users=data.users||[];renderUsers();renderOverview();renderUserFilter()}'''
+          new_load = '''async function loadUsers(){var data=await api('/users');state.users=data.users||[];renderUsers();renderOverview();renderUserFilter();renderRetentionSettings()}'''
+          s = replace_once(s, old_load, new_load, 'loadUsers retention render')
+
+          retention_js_marker = 'function renderUserFilter(){'
+          retention_js = '''function renderRetentionSettings(){var el=document.getElementById('retentionSettings');if(!el)return;if(!state.users.length){el.innerHTML='<div class="empty">添加微信用户后可配置历史数据保留上限。</div>';return}el.innerHTML=state.users.map(function(u){var st=u.status||{};var limit=Math.round(Number(st.historyLimitBytes||750*1024*1024)/1024/1024);var used=Number(st.historyBytes||0);var pct=st.historyLimitBytes?Math.min(100,used/Number(st.historyLimitBytes)*100):0;return'<div class="settingRow"><div style="min-width:0;flex:1"><div class="settingLabel">'+esc(u.name)+' <span class="muted">('+esc(u.id)+')</span></div><div class="settingValue" style="text-align:left">已保留 '+fmtBytes(used)+' · SQLite 文件 '+fmtBytes(st.databaseBytes||0)+(st.retentionLastCleanupAt?' · 最近自动清理 '+esc(fmtTime(st.retentionLastCleanupAt)):'')+'</div><div class="progress" style="margin-top:8px"><div class="progressBar" style="width:'+pct.toFixed(2)+'%"></div></div></div><div style="width:min(280px,100%)"><div style="display:flex;gap:8px"><input id="retention-'+esc(u.id)+'" class="input" type="number" min="50" max="900" step="50" value="'+limit+'" /><button class="btn primary" onclick="saveRetention(\''+esc(u.id)+'\')">保存</button></div><div class="muted" style="margin-top:5px">50–900 MB / 用户，默认 750 MB</div></div></div>'}).join('')}\nasync function saveRetention(id){var input=document.getElementById('retention-'+id);var limit=Number(input&&input.value);if(!Number.isFinite(limit)||limit<50||limit>900){alert('请输入 50–900 MB');return}try{var data=await api('/retention',{userId:id,limitMB:limit});if(data.cleanup&&data.cleanup.pruned)alert('设置已保存，并已自动清理 '+Number(data.cleanup.deletedMessages||0)+' 条较早消息。');await refreshAll()}catch(e){alert(e.message)}}\n'''
+          if retention_js_marker not in s:
+              raise SystemExit('renderUserFilter marker not found')
+          s = s.replace(retention_js_marker, retention_js + retention_js_marker, 1)
+
+          # Overview storage summary now shows total retained history, not only media.
+          s = replace_once(s, "var mediaBytes=users.reduce(function(s,u){return s+Number((u.status||{}).mediaBytes||0)},0);", "var historyBytes=users.reduce(function(s,u){return s+Number((u.status||{}).historyBytes||0)},0);", 'overview history bytes')
+          s = s.replace("fmtBytes(mediaBytes)", "fmtBytes(historyBytes)")
+          s = replace_once(s, "var quota=users.reduce(function(s,u){return s+Number((u.status||{}).mediaSoftQuotaBytes||0)},0);var pct=quota?Math.min(100,historyBytes/quota*100):0;", "var quota=users.reduce(function(s,u){return s+Number((u.status||{}).historyLimitBytes||0)},0);var pct=quota?Math.min(100,historyBytes/quota*100):0;", 'overview quota')
+          s = s.replace('媒体安全软上限合计 ', '历史数据保留上限合计 ')
+          s = s.replace('达到每用户 750MB 软上限后，停止保存新媒体并通过 ClawBot 提醒清理；文本消息仍可继续工作。', '达到配置上限后，系统会自动删除最旧的已处理消息及附件，清理至约 90%，完成后再通过 ClawBot 通知。')
+          p.write_text(s)
+
+          # README
+          p = Path('README.md')
+          s = p.read_text()
+          s = s.replace('Current version: **v0.4.0**.', 'Current version: **v0.5.0**.')
+          s = s.replace('`/setup` redirects to `/admin` for compatibility.\n\n', '`/setup` is intentionally not exposed; `/admin` is the only management entry.\n\n')
+          s = s.replace('## v0.4 features', '## v0.5 features')
+          s = s.replace('- 750 MiB per-user media soft quota. New media stops being persisted at the soft quota and the bound ClawBot receives a cleanup warning.\n', '- Configurable per-user history retention cap, default 750 MiB (50-900 MiB). When retained interaction data exceeds the cap, the oldest processed messages and their attachments are deleted automatically until usage falls to about 90%; pending inbound messages are protected. The bound ClawBot is notified after cleanup.\n')
+          s = s.replace('- Hard SQLite `SQLITE_FULL` errors also trigger a direct ClawBot warning where possible.\n', '- Hard SQLite `SQLITE_FULL` errors still trigger a direct ClawBot warning where possible.\n')
+          s = s.replace('- `/admin` supports responsive desktop/mobile management, media preview/playback/download, media upload/send, history deletion and per-user cleanup.\n', '- `/admin` supports responsive desktop/mobile management, media preview/playback/download, media upload/send, manual history deletion, and configurable automatic retention.\n')
+          p.write_text(s)
+          PY
+      - name: Validate
+        run: |
+          npm install
+          npm run check
+      - name: Commit upgrade
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json README.md src/index.ts src/ilink.ts src/weixin-bot.ts src/setup-page.ts
+          git commit -m 'Add automatic history retention and remove setup route'
+          git push
