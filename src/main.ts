@@ -166,14 +166,28 @@ async function replyByRef(env: Env, globalRef: string, text: string) {
   return { ...response, messageRef: globalRef, user: { id: user.id, name: user.name } };
 }
 
+async function fetchUserMessagesForMerge(env: Env, user: WeixinUserProfile, needed: number) {
+  let total = 0;
+  let offset = 0;
+  const messages: JsonObject[] = [];
+  while (messages.length < needed) {
+    const batchSize = Math.min(500, needed - messages.length);
+    const response = await callUser(env, user.id, `/messages?limit=${batchSize}&offset=${offset}`, { method: "GET" });
+    const batch: JsonObject[] = (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => routeMessage(message, user));
+    total = Number(response.total || 0);
+    messages.push(...batch);
+    offset += batch.length;
+    if (!batch.length || batch.length < batchSize || offset >= total) break;
+  }
+  return { total, messages };
+}
+
 async function aggregateMessages(env: Env, limit: number, offset: number) {
   const list = await profiles(env);
-  const perUserNeed = Math.min(5000, Math.max(limit, limit + offset));
+  const needed = Math.max(0, limit + offset);
   const data = await Promise.all(list.map(async (user) => {
-    try {
-      const response = await callUser(env, user.id, `/messages?limit=${perUserNeed}&offset=0`, { method: "GET" });
-      return { total: Number(response.total || 0), messages: (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => routeMessage(message, user)) };
-    } catch { return { total: 0, messages: [] as JsonObject[] }; }
+    try { return await fetchUserMessagesForMerge(env, user, needed); }
+    catch { return { total: 0, messages: [] as JsonObject[] }; }
   }));
   const messages: JsonObject[] = data.flatMap((item) => item.messages);
   messages.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
