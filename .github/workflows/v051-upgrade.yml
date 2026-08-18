@@ -1,0 +1,34 @@
+name: Upgrade v0.5.1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/v051-upgrade.yml
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/upgrade-v051.mjs
+      - run: npm install --package-lock-only --ignore-scripts
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm test
+      - run: npm run check
+      - name: Commit validated upgrade
+        run: |
+          rm -f scripts/upgrade-v051.mjs .github/workflows/v051-upgrade.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Harden v0.5.1 for production deployment"
+          git push
