@@ -24,8 +24,8 @@ const SYNC_KEY = "sync";
 const INBOX_KEY = "inbox";
 const LOGIN_TTL_MS = 5 * 60_000;
 const SEND_CHUNK_SIZE = 3500;
-const MAX_INBOX_MESSAGES = 500;
-const MAX_INBOUND_TEXT = 20_000;
+const MAX_INBOX_MESSAGES = 300;
+const MAX_INBOUND_TEXT = 4000;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status });
@@ -370,8 +370,6 @@ export class WeixinBotDO extends DurableObject<Env> {
         const known = new Set(inbox.map((message) => message.sourceId));
 
         for (const message of response.msgs || []) {
-          // Owner-only by design: ignore bot echoes and any sender other than the
-          // Weixin user that performed the QR binding.
           if (message.message_type !== undefined && message.message_type !== 1) {
             ignored += 1;
             continue;
