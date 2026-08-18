@@ -1,45 +1,22 @@
 name: Check
 
 on:
+  push:
+    branches: [main]
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   check:
-    if: github.head_ref == 'admin-runtime-fix-v3'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: admin-runtime-fix-v3
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Repair template escape depth
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('src/admin-page.ts')
-          s=p.read_text()
-          # Every backslash-quote inside generated inline JS needs one extra backslash to survive the outer TS template.
-          s=s.replace("\\'", "\\\\'")
-          # Browser JS newline escapes need the same extra template-escape layer.
-          start=s.index('async function testPoll')
-          end=s.index('\nfunction openMedia',start)
-          segment=s[start:end].replace('\\n','\\\\n')
-          s=s[:start]+segment+s[end:]
-          p.write_text(s)
-          PY
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
       - run: npm test
       - run: npm run check
-      - name: Commit validated candidate
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/admin-page.ts
-          git diff --cached --quiet || git commit -m "Fix admin template escape depth"
-          git push origin HEAD:admin-runtime-fix-v3
