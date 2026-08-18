@@ -6,61 +6,17 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: prelaunch-hardening
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Apply final admin security fixes
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          p=Path('src/main.ts')
-          s=p.read_text()
-          old='''    if (url.pathname === "/admin") return new Response(ADMIN_PAGE, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" } });'''
-          new='''    if (url.pathname === "/admin") return new Response(ADMIN_PAGE, { headers: {\n      "content-type": "text/html; charset=utf-8",\n      "cache-control": "no-store",\n      "x-robots-tag": "noindex, nofollow",\n      "x-content-type-options": "nosniff",\n      "referrer-policy": "no-referrer",\n      "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",\n    } });'''
-          if old not in s: raise SystemExit('admin response target not found')
-          s=s.replace(old,new)
-          old='''    if (url.pathname.startsWith("/admin/api/")) {\n      try { return await handleAdmin(request, env, url.pathname); }\n      catch (error) { return Response.json({ error: "admin_error", message: error instanceof Error ? error.message : String(error) }, { status: 400 }); }\n    }'''
-          new='''    if (url.pathname.startsWith("/admin/api/")) {\n      if (request.method !== "GET") {\n        const contentType = (request.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();\n        if (contentType !== "application/json") return Response.json({ error: "unsupported_media_type", message: "管理 API 仅接受 application/json" }, { status: 415 });\n        const origin = request.headers.get("origin");\n        if (origin && origin !== url.origin) return Response.json({ error: "cross_origin_denied", message: "拒绝跨站管理请求" }, { status: 403 });\n      }\n      try {\n        const response = await handleAdmin(request, env, url.pathname);\n        const headers = new Headers(response.headers);\n        headers.set("cache-control", "no-store");\n        headers.set("x-content-type-options", "nosniff");\n        return new Response(response.body, { status: response.status, statusText: response.statusText, headers });\n      }\n      catch (error) { return Response.json({ error: "admin_error", message: error instanceof Error ? error.message : String(error) }, { status: 400, headers: { "cache-control": "no-store" } }); }\n    }'''
-          if old not in s: raise SystemExit('admin api target not found')
-          s=s.replace(old,new)
-          p.write_text(s)
-
-          # Avoid putting display names inside inline JS string literals. IDs are
-          # validated to [a-z0-9_-], and handlers resolve the display name from state.
-          p=Path('src/admin-page.ts')
-          s=p.read_text()
-          replacements={
-            "onclick=\"startBind(\\''+esc(u.id)+'\\',\\''+esc(u.name)+'\\')\"":"onclick=\"startBind(\\''+esc(u.id)+'\\')\"",
-            "onclick=\"renameUser(\\''+esc(u.id)+'\\',\\''+esc(u.name)+'\\')\"":"onclick=\"renameUser(\\''+esc(u.id)+'\\')\"",
-            "onclick=\"deleteUser(\\''+esc(u.id)+'\\',\\''+esc(u.name)+'\\')\"":"onclick=\"deleteUser(\\''+esc(u.id)+'\\')\"",
-            "async function startBind(id,name){":"async function startBind(id){var user=state.users.find(function(u){return u.id===id}),name=user?user.name:id;",
-            "async function renameUser(id,name){var n=prompt('显示名称：',name);":"async function renameUser(id){var user=state.users.find(function(u){return u.id===id}),name=user?user.name:id,n=prompt('显示名称：',name);",
-            "async function deleteUser(id,name){if(!confirm('删除“'+name+'”会清除绑定凭证、历史消息、附件及留存设置。确定？'))return;":"async function deleteUser(id){var user=state.users.find(function(u){return u.id===id}),name=user?user.name:id;if(!confirm('删除“'+name+'”会清除绑定凭证、历史消息、附件及留存设置。确定？'))return;",
-          }
-          for old,new in replacements.items():
-            if old not in s: raise SystemExit('admin-page patch target not found: '+old[:50])
-            s=s.replace(old,new)
-          p.write_text(s)
-          PY
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
       - run: npm test
       - run: npm run check
-      - name: Commit validated admin security fixes
-        if: github.event_name == 'pull_request'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/main.ts src/admin-page.ts
-          git diff --cached --quiet || git commit -m "Harden admin CSRF and browser rendering boundaries"
-          git push origin HEAD:prelaunch-hardening
