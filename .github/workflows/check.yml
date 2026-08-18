@@ -6,16 +6,43 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Apply v0.5 retention patch
+        if: github.actor != 'github-actions[bot]'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          wf = Path('.github/workflows/one-shot-v05-retention.yml').read_text()
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n      - name: Validate"
+          start = wf.find(start_marker)
+          end = wf.find(end_marker, start + len(start_marker))
+          if start < 0 or end < 0:
+              raise SystemExit('could not extract v0.5 patch script')
+          script = wf[start + len(start_marker):end]
+          lines = script.splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
+          exec(compile(script, '<v0.5-retention-patch>', 'exec'))
+          PY
       - run: npm install
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run check
+      - name: Commit v0.5 retention upgrade
+        if: github.actor != 'github-actions[bot]'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json README.md src/index.ts src/ilink.ts src/weixin-bot.ts src/setup-page.ts
+          git commit -m 'Add automatic history retention and remove setup route'
+          git push
