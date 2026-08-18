@@ -6,49 +6,17 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: review-v051
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Apply final review fixes
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('src/bot.ts')
-          s = p.read_text()
-          old = '''  private async notifyRetentionCleanup(summary: RetentionCleanupSummary) {\n    const mb = (n: number) => (n / 1024 / 1024).toFixed(1);\n    await this.alertText(`微信 MCP 已自动清理历史数据：删除 ${summary.deletedMessages} 条较早的已处理消息及其附件，附件约 ${mb(summary.deletedMediaBytes)} MB。当前保留约 ${mb(summary.afterBytes)} MB，配置上限 ${mb(summary.limitBytes)} MB。尚未处理的微信消息不会被自动删除。`);\n  }'''
-          new = '''  private async notifyRetentionCleanup(summary: RetentionCleanupSummary) {\n    const mb = (n: number) => (n / 1024 / 1024).toFixed(1);\n    // Cleanup summaries must always be attempted; the cooldown is only for repetitive hard-storage alerts.\n    this.lastStorageAlertAt = 0;\n    await this.alertText(`微信 MCP 已自动清理历史数据：删除 ${summary.deletedMessages} 条较早的已处理消息及其附件，附件约 ${mb(summary.deletedMediaBytes)} MB。当前保留约 ${mb(summary.afterBytes)} MB，配置上限 ${mb(summary.limitBytes)} MB。尚未处理的微信消息不会被自动删除。`);\n  }'''
-          if old not in s:
-              raise SystemExit('notifyRetentionCleanup patch target not found')
-          s = s.replace(old, new)
-          s = s.replace('const limit=Math.min(1000,Math.max(1,Number.parseInt(url.searchParams.get("limit") || "50",10) || 50));', 'const limit=Math.min(5000,Math.max(1,Number.parseInt(url.searchParams.get("limit") || "50",10) || 50));')
-          p.write_text(s)
-
-          p = Path('src/main.ts')
-          s = p.read_text()
-          start = s.index('async function aggregateMessages(')
-          end = s.index('async function readGlobalMedia', start)
-          replacement = '''async function fetchUserMessagesForMerge(env: Env, user: WeixinUserProfile, needed: number) {\n  let total = 0;\n  let offset = 0;\n  const messages: JsonObject[] = [];\n  while (messages.length < needed) {\n    const batchSize = Math.min(500, needed - messages.length);\n    const response = await callUser(env, user.id, `/messages?limit=${batchSize}&offset=${offset}`, { method: "GET" });\n    const batch: JsonObject[] = (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => routeMessage(message, user));\n    total = Number(response.total || 0);\n    messages.push(...batch);\n    offset += batch.length;\n    if (!batch.length || batch.length < batchSize || offset >= total) break;\n  }\n  return { total, messages };\n}\n\nasync function aggregateMessages(env: Env, limit: number, offset: number) {\n  const list = await profiles(env);\n  const needed = Math.max(0, limit + offset);\n  const data = await Promise.all(list.map(async (user) => {\n    try { return await fetchUserMessagesForMerge(env, user, needed); }\n    catch { return { total: 0, messages: [] as JsonObject[] }; }\n  }));\n  const messages: JsonObject[] = data.flatMap((item) => item.messages);\n  messages.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));\n  return { total: data.reduce((sum, item) => sum + item.total, 0), limit, offset, messages: messages.slice(offset, offset + limit) };\n}\n\n'''
-          s = s[:start] + replacement + s[end:]
-          p.write_text(s)
-          PY
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
       - run: npm test
       - run: npm run check
-      - name: Commit validated review fixes
-        if: github.event_name == 'pull_request'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/bot.ts src/main.ts
-          git diff --cached --quiet || git commit -m "Finalize v0.5.1 review fixes"
-          git push origin HEAD:review-v051
