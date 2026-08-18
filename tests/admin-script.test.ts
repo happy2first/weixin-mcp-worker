@@ -10,7 +10,7 @@ test("admin inline script parses as valid JavaScript", () => {
     new vm.Script(match[1], { filename: "admin-inline.js" });
   } catch (error) {
     const lines = match[1].split("\n");
-    console.error(lines.slice(34, 44).map((line, index) => `${index + 35}: ${line}`).join("\n"));
-    throw error;
+    const context = lines.slice(34, 44).map((line, index) => `${index + 35}: ${line}`).join("\n");
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${context}`);
   }
 });
