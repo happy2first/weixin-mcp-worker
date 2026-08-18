@@ -28,7 +28,7 @@ const LOGIN_TTL_MS = 5 * 60_000;
 const SEND_CHUNK_SIZE = 3500;
 const MAX_INBOUND_TEXT = 20_000;
 
-interface MessageRow {
+type MessageRow = {
   message_ref: string;
   source_id: string | null;
   direction: "inbound" | "outbound";
@@ -43,7 +43,7 @@ interface MessageRow {
   metadata_json: string | null;
   external_ids_json: string | null;
   error: string | null;
-}
+};
 
 type PollResult = {
   success: true;
