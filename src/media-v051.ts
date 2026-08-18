@@ -90,13 +90,36 @@ function buildDownloadUrl(encryptQueryParam: string, fullUrl?: string): string {
 }
 
 async function fetchBounded(url: string): Promise<Uint8Array> {
-  const response = await fetch(normalizeHttpsUrl(url));
-  if (!response.ok) throw new Error(`微信 CDN 下载失败：HTTP ${response.status}`);
-  const declared = Number(response.headers.get("content-length") || "0");
-  if (declared > MAX_MEDIA_BYTES) throw new Error(`媒体文件过大：${declared} bytes，当前上限 ${MAX_MEDIA_BYTES} bytes`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_MEDIA_BYTES) throw new Error(`媒体文件过大：${bytes.byteLength} bytes，当前上限 ${MAX_MEDIA_BYTES} bytes`);
-  return bytes;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const response = await fetch(normalizeHttpsUrl(url), { signal: controller.signal });
+    if (!response.ok) throw new Error(`微信 CDN 下载失败：HTTP ${response.status}`);
+    const declared = Number(response.headers.get("content-length") || "0");
+    if (declared > MAX_MEDIA_BYTES) throw new Error(`媒体文件过大：${declared} bytes，当前上限 ${MAX_MEDIA_BYTES} bytes`);
+    if (!response.body) return new Uint8Array();
+    const reader = response.body.getReader();
+    const output = new Uint8Array(MAX_MEDIA_BYTES);
+    let offset = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        if (offset + value.byteLength > MAX_MEDIA_BYTES) {
+          await reader.cancel("media too large").catch(() => undefined);
+          throw new Error(`媒体文件过大：超过当前 ${MAX_MEDIA_BYTES} bytes 上限`);
+        }
+        output.set(value, offset);
+        offset += value.byteLength;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return output.subarray(0, offset);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function downloadMedia(ref: { encrypt_query_param?: string; aes_key?: string; full_url?: string }, aesKeyOverrideBase64?: string): Promise<Uint8Array> {

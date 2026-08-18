@@ -700,25 +700,38 @@ export class WeixinBotDO extends DurableObject<Env> {
     const outboundRef=`out_${crypto.randomUUID().replace(/-/g,"")}`;
     const messageIds:string[]=[];
     let replyContext=row.context_token || account.contextToken;
+    await this.safeEnforceRetention();
     try {
       for (let i=0;i<chunks.length;i+=1) {
         const sent=await this.sendTextWithRecovery(account,row.from_user_id,chunks[i],replyContext);
         messageIds.push(sent.value);replyContext=sent.contextToken;
         if (i < chunks.length - 1) await sleep(SEND_CHUNK_DELAY_MS);
       }
-      const repliedAt=new Date().toISOString();
-      this.ctx.storage.sql.exec("UPDATE messages SET status='replied',replied_at=?,error=NULL WHERE message_ref=?",repliedAt,messageRef);
-      this.insertHistory({ message_ref:outboundRef,source_id:null,direction:"outbound",kind:"text",text,status:"sent",context_token:null,from_user_id:null,created_at:repliedAt,replied_at:null,reply_to:messageRef,metadata_json:JSON.stringify({ chunks:chunks.length }),external_ids_json:JSON.stringify(messageIds),error:null });
-      if (replyContext) account.contextToken=replyContext; else delete account.contextToken;
-      await this.ctx.storage.put(ACCOUNT_KEY,account);
-      const cleanup=await this.safeEnforceRetention();
-      return { success:true,alreadyReplied:false,messageRef,outboundMessageRef:outboundRef,chunks:chunks.length,messageIds,repliedAt,cleanup };
     } catch (error) {
-      this.ctx.storage.sql.exec("UPDATE messages SET error=? WHERE message_ref=?",errorMessage(error),messageRef);
+      try { this.ctx.storage.sql.exec("UPDATE messages SET error=? WHERE message_ref=?",errorMessage(error),messageRef); } catch {}
       try { this.insertHistory({ message_ref:outboundRef,source_id:null,direction:"outbound",kind:"text",text,status:"failed",context_token:null,from_user_id:null,created_at:new Date().toISOString(),replied_at:null,reply_to:messageRef,metadata_json:JSON.stringify({ chunks:chunks.length }),external_ids_json:JSON.stringify(messageIds),error:errorMessage(error) }); } catch (historyError) { await this.alertStorageFull(historyError); }
       await this.safeEnforceRetention();
       throw error;
     }
+
+    const repliedAt=new Date().toISOString();
+    let stateWarning:string | null=null;
+    try {
+      this.ctx.storage.sql.exec("UPDATE messages SET status='replied',replied_at=?,error=NULL WHERE message_ref=?",repliedAt,messageRef);
+    } catch (firstStateError) {
+      await this.safeEnforceRetention();
+      try {
+        this.ctx.storage.sql.exec("UPDATE messages SET status='replied',replied_at=?,error=NULL WHERE message_ref=?",repliedAt,messageRef);
+      } catch (retryStateError) {
+        stateWarning=errorMessage(retryStateError);
+        await this.alertStorageFull(retryStateError);
+      }
+    }
+    const historyWarning=await this.persistDeliveredHistory({ message_ref:outboundRef,source_id:null,direction:"outbound",kind:"text",text,status:"sent",context_token:null,from_user_id:null,created_at:repliedAt,replied_at:null,reply_to:messageRef,metadata_json:JSON.stringify({ chunks:chunks.length }),external_ids_json:JSON.stringify(messageIds),error:null });
+    if (replyContext) account.contextToken=replyContext; else delete account.contextToken;
+    try { await this.ctx.storage.put(ACCOUNT_KEY,account); } catch (accountError) { stateWarning=stateWarning || errorMessage(accountError); }
+    const cleanup=await this.safeEnforceRetention();
+    return { success:true,alreadyReplied:false,messageRef,outboundMessageRef:outboundRef,chunks:chunks.length,messageIds,repliedAt,historyWarning,stateWarning,cleanup };
   }
 
   private listMessages(limit:number,offset:number) {
