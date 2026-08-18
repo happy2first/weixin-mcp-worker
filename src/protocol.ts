@@ -209,11 +209,19 @@ export async function uploadMediaBuffer(env: Env, params: {
   if (!rawTarget) throw new Error("微信 getUploadUrl 未返回上传地址");
   const target = normalizeHttpsUrl(rawTarget);
   const ciphertext = encryptAesEcb(params.bytes, aesKey);
-  const response = await fetch(target, {
-    method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: ciphertext.slice().buffer as ArrayBuffer,
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  let response: Response;
+  try {
+    response = await fetch(target, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: ciphertext.slice().buffer as ArrayBuffer,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
   if (!response.ok) {
     const detail = response.headers.get("x-error-message") || await response.text().catch(() => "");
     throw new Error(`微信 CDN 上传失败：HTTP ${response.status}${detail ? ` ${detail.slice(0, 300)}` : ""}`);
