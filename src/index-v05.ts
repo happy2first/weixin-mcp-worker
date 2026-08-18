@@ -46,7 +46,7 @@ function enhanceAdminHtml(source: string): string {
 }
 
 async function handleRetentionAdmin(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const authProbe = await baseWorker.fetch(request.clone(), env, ctx);
+  const authProbe = await (baseWorker.fetch as any)(request.clone(), env, ctx) as Response;
   if (authProbe.status === 403) return authProbe;
   try {
     const body = await request.json().catch(() => ({})) as Record<string, unknown>;
@@ -80,7 +80,7 @@ export default {
       return handleRetentionAdmin(request, env, ctx);
     }
 
-    const response = await baseWorker.fetch(request, env, ctx);
+    const response = await (baseWorker.fetch as any)(request, env, ctx) as Response;
     if (url.pathname === "/admin" && response.ok) {
       const html = enhanceAdminHtml(await response.text());
       const headers = new Headers(response.headers);
