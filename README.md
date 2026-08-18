@@ -175,3 +175,7 @@ This repository is independent and is not an official Tencent or Weixin product.
 ## License
 
 MIT.
+
+## CI
+
+Every push to `main` runs TypeScript checking and `wrangler deploy --dry-run` through GitHub Actions before the version is treated as deployment-ready.
