@@ -258,6 +258,8 @@ export class WeixinBotDO extends DurableObject<Env> {
 
   private async notifyRetentionCleanup(summary: RetentionCleanupSummary) {
     const mb = (n: number) => (n / 1024 / 1024).toFixed(1);
+    // Cleanup summaries must always be attempted; the cooldown is only for repetitive hard-storage alerts.
+    this.lastStorageAlertAt = 0;
     await this.alertText(`微信 MCP 已自动清理历史数据：删除 ${summary.deletedMessages} 条较早的已处理消息及其附件，附件约 ${mb(summary.deletedMediaBytes)} MB。当前保留约 ${mb(summary.afterBytes)} MB，配置上限 ${mb(summary.limitBytes)} MB。尚未处理的微信消息不会被自动删除。`);
   }
 
@@ -754,7 +756,7 @@ export class WeixinBotDO extends DurableObject<Env> {
       if (request.method === "GET" && url.pathname === "/status") return json(await this.status());
       if (request.method === "GET" && url.pathname === "/retention") { this.ensureSchema(); return json(await retentionStatus(this.ctx.storage as any)); }
       if (request.method === "GET" && url.pathname === "/messages") {
-        const limit=Math.min(1000,Math.max(1,Number.parseInt(url.searchParams.get("limit") || "50",10) || 50));
+        const limit=Math.min(5000,Math.max(1,Number.parseInt(url.searchParams.get("limit") || "50",10) || 50));
         const offset=Math.max(0,Number.parseInt(url.searchParams.get("offset") || "0",10) || 0);
         return json(this.listMessages(limit,offset));
       }
