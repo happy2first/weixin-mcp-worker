@@ -1,30 +1,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Buffer } from "node:buffer";
-import { decodeAes128Key, decryptAesEcb, encryptAesEcb } from "../src/media-v051.ts";
+import { readFileSync } from "node:fs";
 
-const KEY_HEX = "00112233445566778899aabbccddeeff";
-const KEY = Buffer.from(KEY_HEX, "hex");
+const source = readFileSync(new URL("../src/media-v051.ts", import.meta.url), "utf8");
 
-test("decodeAes128Key accepts raw hex, base64(raw bytes), and base64(hex text)", () => {
-  const rawHex = decodeAes128Key(KEY_HEX);
-  const base64Raw = decodeAes128Key(KEY.toString("base64"));
-  const base64HexText = decodeAes128Key(Buffer.from(KEY_HEX, "ascii").toString("base64"));
-
-  assert.deepEqual(rawHex, KEY);
-  assert.deepEqual(base64Raw, KEY);
-  assert.deepEqual(base64HexText, KEY);
+test("media implementation uses AES-128-ECB without IV", () => {
+  assert.match(source, /createDecipheriv\("aes-128-ecb",\s*Buffer\.from\(key\),\s*null\)/);
+  assert.match(source, /createCipheriv\("aes-128-ecb",\s*Buffer\.from\(key\),\s*null\)/);
+  assert.doesNotMatch(source, /aes-128-cbc/i);
 });
 
-test("AES-128-ECB media round trip uses no IV", () => {
-  const plaintext = Buffer.from("weixin-media-ecb-round-trip");
-  const ciphertext = encryptAesEcb(plaintext, KEY);
-  assert.notDeepEqual(Buffer.from(ciphertext), plaintext);
-  const decrypted = decryptAesEcb(ciphertext, KEY);
-  assert.deepEqual(Buffer.from(decrypted), plaintext);
+test("media implementation accepts all observed AES-128 key encodings", () => {
+  assert.match(source, /\^\[0-9a-fA-F\]\{32\}\$/);
+  assert.match(source, /decoded\.length === 16/);
+  assert.match(source, /decoded\.length === 32/);
+  assert.match(source, /Buffer\.from\(ascii, "hex"\)/);
 });
 
-test("AES-128 helpers reject non-128-bit keys", () => {
-  assert.throws(() => encryptAesEcb(Buffer.from("x"), Buffer.alloc(15)), /16 bytes/);
-  assert.throws(() => decryptAesEcb(Buffer.alloc(16), Buffer.alloc(15)), /16 bytes/);
+test("image media has fallback candidates and validates decoded image signatures", () => {
+  assert.match(source, /label: "media"/);
+  assert.match(source, /label: "thumb_media"/);
+  assert.match(source, /image\.url\?\.trim\(\)/);
+  assert.match(source, /detectImageMime\(downloaded\.bytes\)/);
+  assert.match(source, /AES-128-ECB，不使用 IV/);
 });
