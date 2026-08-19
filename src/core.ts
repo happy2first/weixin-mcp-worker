@@ -1,4 +1,4 @@
-export const VERSION = "0.5.2";
+export const VERSION = "0.5.3";
 export const MIB = 1024 * 1024;
 export const DEFAULT_RETENTION_LIMIT_BYTES = 700 * MIB;
 export const MIN_RETENTION_LIMIT_BYTES = 50 * MIB;
