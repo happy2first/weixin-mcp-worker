@@ -8,6 +8,11 @@ export const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 export const MEDIA_CHUNK_BYTES = 1024 * 1024;
 export const MCP_EMBED_MAX_BYTES = 8 * 1024 * 1024;
 
+// AES-ECB does not use an IV. Node.js permits null here, but Cloudflare
+// Workers' node:crypto compatibility layer currently rejects null. A
+// zero-length Buffer represents the same no-IV semantics and works in Node.
+const ECB_NO_IV = Buffer.alloc(0);
+
 export type DownloadedMedia = {
   kind: Extract<MessageKind, "image" | "voice" | "file" | "video">;
   mimeType: string;
@@ -88,14 +93,14 @@ export function decodeAes128Key(value: string): Buffer {
 
 export function decryptAesEcb(ciphertext: Uint8Array, key: Uint8Array): Uint8Array {
   if (key.byteLength !== 16) throw new Error(`AES-128 key 必须为 16 bytes，实际 ${key.byteLength}`);
-  const decipher = createDecipheriv("aes-128-ecb", Buffer.from(key), null);
+  const decipher = createDecipheriv("aes-128-ecb", Buffer.from(key), ECB_NO_IV);
   decipher.setAutoPadding(true);
   return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(ciphertext)), decipher.final()]));
 }
 
 export function encryptAesEcb(plaintext: Uint8Array, key: Uint8Array): Uint8Array {
   if (key.byteLength !== 16) throw new Error(`AES-128 key 必须为 16 bytes，实际 ${key.byteLength}`);
-  const cipher = createCipheriv("aes-128-ecb", Buffer.from(key), null);
+  const cipher = createCipheriv("aes-128-ecb", Buffer.from(key), ECB_NO_IV);
   cipher.setAutoPadding(true);
   return new Uint8Array(Buffer.concat([cipher.update(Buffer.from(plaintext)), cipher.final()]));
 }
