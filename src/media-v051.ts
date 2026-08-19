@@ -40,7 +40,7 @@ function extMime(fileName: string): string {
   return "application/octet-stream";
 }
 
-function imageMime(buf: Uint8Array): string {
+function detectImageMime(buf: Uint8Array): string | null {
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
   if (buf.length >= 8 && Buffer.from(buf.subarray(0, 8)).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]))) return "image/png";
   if (buf.length >= 6) {
@@ -48,7 +48,7 @@ function imageMime(buf: Uint8Array): string {
     if (sig === "GIF87a" || sig === "GIF89a") return "image/gif";
   }
   if (buf.length >= 12 && Buffer.from(buf.subarray(0, 4)).toString("ascii") === "RIFF" && Buffer.from(buf.subarray(8, 12)).toString("ascii") === "WEBP") return "image/webp";
-  return "image/jpeg";
+  return null;
 }
 
 function voiceMime(encodeType?: number): { mimeType: string; extension: string } {
@@ -62,20 +62,39 @@ function voiceMime(encodeType?: number): { mimeType: string; extension: string }
   }
 }
 
-function parseAesKey(aesKeyBase64: string): Buffer {
-  const decoded = Buffer.from(aesKeyBase64, "base64");
+/**
+ * Weixin currently emits AES-128 media keys in three shapes depending on the field/version:
+ * 1) raw 32-char hex (notably image_item.aeskey)
+ * 2) base64(raw 16 bytes)
+ * 3) base64(32 ASCII hex chars)
+ *
+ * All are normalized to the exact 16-byte AES key used by AES-128-ECB.
+ */
+export function decodeAes128Key(value: string): Buffer {
+  const text = String(value || "").trim();
+  if (!text) throw new Error("微信媒体 AES key 为空");
+
+  if (/^[0-9a-fA-F]{32}$/.test(text)) return Buffer.from(text, "hex");
+
+  const decoded = Buffer.from(text, "base64");
   if (decoded.length === 16) return decoded;
-  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("ascii"))) return Buffer.from(decoded.toString("ascii"), "hex");
-  throw new Error(`微信媒体 AES key 格式无效：解码后 ${decoded.length} bytes`);
+  if (decoded.length === 32) {
+    const ascii = decoded.toString("ascii");
+    if (/^[0-9a-fA-F]{32}$/.test(ascii)) return Buffer.from(ascii, "hex");
+  }
+
+  throw new Error(`微信媒体 AES key 格式无效：base64 解码后 ${decoded.length} bytes`);
 }
 
 export function decryptAesEcb(ciphertext: Uint8Array, key: Uint8Array): Uint8Array {
+  if (key.byteLength !== 16) throw new Error(`AES-128 key 必须为 16 bytes，实际 ${key.byteLength}`);
   const decipher = createDecipheriv("aes-128-ecb", Buffer.from(key), null);
   decipher.setAutoPadding(true);
   return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(ciphertext)), decipher.final()]));
 }
 
 export function encryptAesEcb(plaintext: Uint8Array, key: Uint8Array): Uint8Array {
+  if (key.byteLength !== 16) throw new Error(`AES-128 key 必须为 16 bytes，实际 ${key.byteLength}`);
   const cipher = createCipheriv("aes-128-ecb", Buffer.from(key), null);
   cipher.setAutoPadding(true);
   return new Uint8Array(Buffer.concat([cipher.update(Buffer.from(plaintext)), cipher.final()]));
@@ -122,47 +141,91 @@ async function fetchBounded(url: string): Promise<Uint8Array> {
   }
 }
 
-async function downloadMedia(ref: { encrypt_query_param?: string; aes_key?: string; full_url?: string }, aesKeyOverrideBase64?: string): Promise<Uint8Array> {
+async function downloadMedia(
+  ref: { encrypt_query_param?: string; aes_key?: string; full_url?: string },
+  aesKeyOverride?: string,
+): Promise<{ bytes: Uint8Array; decrypted: boolean }> {
   const encrypted = await fetchBounded(buildDownloadUrl(ref.encrypt_query_param || "", ref.full_url));
-  const aesKey = aesKeyOverrideBase64 || ref.aes_key;
-  if (!aesKey) return encrypted;
-  return decryptAesEcb(encrypted, parseAesKey(aesKey));
+  const aesKey = String(aesKeyOverride || ref.aes_key || "").trim();
+  if (!aesKey) return { bytes: encrypted, decrypted: false };
+  return { bytes: decryptAesEcb(encrypted, decodeAes128Key(aesKey)), decrypted: true };
+}
+
+async function downloadInboundImage(item: WeixinMessageItem, itemIndex: number): Promise<DownloadedMedia | null> {
+  const image = item.image_item;
+  if (!image) return null;
+  const errors: string[] = [];
+
+  const candidates: Array<{
+    label: string;
+    ref?: { encrypt_query_param?: string; aes_key?: string; full_url?: string };
+    keyOverride?: string;
+  }> = [
+    { label: "media", ref: image.media, keyOverride: image.aeskey },
+    { label: "thumb_media", ref: image.thumb_media },
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.ref || (!candidate.ref.encrypt_query_param && !candidate.ref.full_url)) continue;
+    try {
+      const downloaded = await downloadMedia(candidate.ref, candidate.keyOverride);
+      const mimeType = detectImageMime(downloaded.bytes);
+      if (!mimeType) {
+        if (!downloaded.decrypted) throw new Error("缺少可用 AES key，CDN 内容看起来仍为密文");
+        throw new Error("AES-128-ECB 解密完成，但结果不是受支持的 JPEG/PNG/GIF/WebP 图片");
+      }
+      const extension = mimeType === "image/png" ? "png" : mimeType === "image/gif" ? "gif" : mimeType === "image/webp" ? "webp" : "jpg";
+      return { kind: "image", mimeType, fileName: `weixin-image-${item.msg_id || itemIndex}.${extension}`, bytes: downloaded.bytes, itemIndex };
+    } catch (error) {
+      errors.push(`${candidate.label}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (image.url?.trim()) {
+    try {
+      const bytes = await fetchBounded(image.url.trim());
+      const mimeType = detectImageMime(bytes);
+      if (!mimeType) throw new Error("直链内容不是受支持的 JPEG/PNG/GIF/WebP 图片");
+      const extension = mimeType === "image/png" ? "png" : mimeType === "image/gif" ? "gif" : mimeType === "image/webp" ? "webp" : "jpg";
+      return { kind: "image", mimeType, fileName: `weixin-image-${item.msg_id || itemIndex}.${extension}`, bytes, itemIndex };
+    } catch (error) {
+      errors.push(`url: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  if (errors.length) throw new Error(`微信图片下载/解密失败（AES-128-ECB，不使用 IV）：${errors.join("；")}`);
+  return null;
 }
 
 export async function downloadInboundMedia(item: WeixinMessageItem, itemIndex: number): Promise<DownloadedMedia | null> {
-  if (item.type === 2) {
-    const image = item.image_item;
-    const ref = image?.media;
-    if (!ref || (!ref.encrypt_query_param && !ref.full_url)) return null;
-    const override = image?.aeskey ? Buffer.from(image.aeskey, "hex").toString("base64") : undefined;
-    const bytes = await downloadMedia(ref, override);
-    const mimeType = imageMime(bytes);
-    const extension = mimeType === "image/png" ? "png" : mimeType === "image/gif" ? "gif" : mimeType === "image/webp" ? "webp" : "jpg";
-    return { kind: "image", mimeType, fileName: `weixin-image-${item.msg_id || itemIndex}.${extension}`, bytes, itemIndex };
-  }
+  if (item.type === 2) return downloadInboundImage(item, itemIndex);
+
   if (item.type === 3) {
     const voice = item.voice_item;
     const ref = voice?.media;
     if (!ref || (!ref.encrypt_query_param && !ref.full_url) || !ref.aes_key) return null;
-    const bytes = await downloadMedia(ref);
+    const { bytes } = await downloadMedia(ref);
     const format = voiceMime(voice?.encode_type);
     return { kind: "voice", mimeType: format.mimeType, fileName: `weixin-voice-${item.msg_id || itemIndex}.${format.extension}`, bytes, itemIndex };
   }
+
   if (item.type === 4) {
     const file = item.file_item;
     const ref = file?.media;
     if (!ref || (!ref.encrypt_query_param && !ref.full_url) || !ref.aes_key) return null;
-    const bytes = await downloadMedia(ref);
+    const { bytes } = await downloadMedia(ref);
     const fileName = file?.file_name?.trim() || `weixin-file-${item.msg_id || itemIndex}.bin`;
     return { kind: "file", mimeType: extMime(fileName), fileName, bytes, itemIndex };
   }
+
   if (item.type === 5) {
     const video = item.video_item;
     const ref = video?.media;
     if (!ref || (!ref.encrypt_query_param && !ref.full_url) || !ref.aes_key) return null;
-    const bytes = await downloadMedia(ref);
+    const { bytes } = await downloadMedia(ref);
     return { kind: "video", mimeType: "video/mp4", fileName: `weixin-video-${item.msg_id || itemIndex}.mp4`, bytes, itemIndex };
   }
+
   return null;
 }
 
