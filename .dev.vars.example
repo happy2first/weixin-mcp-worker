@@ -1,0 +1,8 @@
+# Cloudflare Access team origin. Do NOT append /cdn-cgi/access/certs.
+TEAM_DOMAIN=https://your-team.cloudflareaccess.com
+
+# Application Audience (AUD) Tag from the Cloudflare Access application.
+POLICY_AUD=replace-with-access-application-aud
+
+# Optional. Keep aligned with the Tencent openclaw-weixin channel version if iLink changes its client compatibility requirements.
+ILINK_CLIENT_VERSION=2.4.6
