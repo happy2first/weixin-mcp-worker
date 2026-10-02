@@ -6,3 +6,11 @@ POLICY_AUD=replace-with-access-application-aud
 
 # Optional. Keep aligned with the Tencent openclaw-weixin channel version if iLink changes its client compatibility requirements.
 ILINK_CLIENT_VERSION=2.4.6
+
+# Required Secret for Events: 32 random bytes as 64 hexadecimal characters.
+# Production: npx wrangler secret put EVENTS_ENCRYPTION_KEY
+# EVENTS_ENCRYPTION_KEY=<generate locally; never commit a real key>
+# Omit to enable; only the literal false disables discovery and event delivery.
+# EVENTS_ENABLED=false
+# Optional exact OpenAI host allowlist override (comma separated, no wildcard).
+# EVENTS_CALLBACK_HOSTS=connectors.api.openai.com

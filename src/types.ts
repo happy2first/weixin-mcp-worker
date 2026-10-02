@@ -5,6 +5,9 @@ export interface Env {
   TEAM_DOMAIN: string;
   POLICY_AUD: string;
   ILINK_CLIENT_VERSION?: string;
+  EVENTS_ENABLED?: string;
+  EVENTS_CALLBACK_HOSTS?: string;
+  EVENTS_ENCRYPTION_KEY?: string;
 }
 
 export interface WeixinUserProfile {

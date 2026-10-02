@@ -1,3 +1,5 @@
+import { authorized, eventsEnabled } from "./events.js";
+import { eventDiagnostic } from "./events-diagnostics.js";
 import { Buffer } from "node:buffer";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
@@ -139,7 +141,7 @@ async function pollRecipients(env: Env, limit: number, requested?: string[]) {
   const perUserLimit = Math.min(50, Math.max(1, limit));
   const results = await Promise.all(targets.map(async (user) => {
     try {
-      const response = await callUser(env, user.id, "/poll", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: perUserLimit }) });
+      const response = await callUser(env, user.id, "/poll", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ limit: perUserLimit, userId: user.id, claim: true }) });
       const messages: JsonObject[] = (Array.isArray(response.messages) ? response.messages : []).map((message: JsonObject) => routeMessage(message, user));
       return { user: { id: user.id, name: user.name }, success: true, ...response, messages };
     } catch (error) {
@@ -151,18 +153,30 @@ async function pollRecipients(env: Env, limit: number, requested?: string[]) {
   return { success: results.every((item) => item.success), pending: results.reduce((sum, item) => sum + Number(item.pending || 0), 0), messages: messages.slice(0, limit), users: results.map(({ messages: _messages, ...rest }) => rest) };
 }
 
+async function claimByRefs(env: Env, refs: string[]) {
+  const list = await profiles(env), messages: JsonObject[] = [];
+  const grouped = new Map<string,string[]>();
+  for (const ref of refs) { const { userId, localRef } = splitGlobalRef(ref); const group = grouped.get(userId) || []; group.push(localRef); grouped.set(userId, group); }
+  for (const [userId, localRefs] of grouped) {
+    const user = list.find(u => u.id === userId && u.enabled); if (!user) continue;
+    const data = await callUser(env,userId,"/messages/claim", { method:"POST",body:JSON.stringify({messageRefs:localRefs}) });
+    for (const message of data.messages || []) messages.push({ ...routeMessage(message,user),processingToken:data.processingToken });
+  }
+  return {success:true,messages,pending:messages.length};
+}
+
 function splitGlobalRef(globalRef: string): { userId: string; localRef: string } {
   const index = globalRef.indexOf(":");
   if (index <= 0) throw new Error("引用格式无效，请使用 MCP 返回的原值");
   return { userId: normalizeProfileId(globalRef.slice(0, index)), localRef: globalRef.slice(index + 1) };
 }
 
-async function replyByRef(env: Env, globalRef: string, text: string) {
+async function replyByRef(env: Env, globalRef: string, text: string, processingToken?: string) {
   const { userId, localRef } = splitGlobalRef(globalRef);
   const list = await profiles(env);
   const user = list.find((item) => item.id === userId);
   if (!user) throw new Error(`messageRef 对应的微信用户 ${userId} 已不存在`);
-  const response = await callUser(env, userId, "/reply", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ messageRef: localRef, text }) });
+  const response = await callUser(env, userId, "/reply", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ messageRef: localRef, text, processingToken }) });
   return { ...response, messageRef: globalRef, user: { id: user.id, name: user.name } };
 }
 
@@ -268,9 +282,9 @@ function createServer(env: Env) {
   server.registerTool("weixin_status", { description: "检查微信 MCP 的多用户绑定、消息、历史存储、自动清理和最近轮询状态。不会返回凭证。", inputSchema: {} }, async () => result(await usersWithStatus(env)));
   server.registerTool("weixin_send", { description: "发送文本给一个或多个已配置微信用户。省略 recipients 时发送给默认用户。", inputSchema: { recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional(), text: z.string().min(1).max(70_000) } }, async ({ recipients, text }) => result(await sendToRecipients(env, text, recipients)));
   server.registerTool("weixin_send_media", { description: "发送图片、文件或视频。媒体可来自 base64 或已有 sourceMediaRef；不发送语音。", inputSchema: { recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional(), kind: z.enum(["image", "file", "video"]), dataBase64: z.string().optional(), sourceMediaRef: z.string().optional(), mimeType: z.string().max(120).optional(), fileName: z.string().max(180).optional(), caption: z.string().max(70_000).optional() } }, async (args) => result(await sendMediaToRecipients(env, args as any)));
-  server.registerTool("weixin_poll", { description: "按需拉取所有启用用户发给 ClawBot 的新消息，适合 ChatGPT 每小时任务调用。", inputSchema: { limit: z.number().int().min(1).max(100).optional().default(20), recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional() } }, async ({ limit, recipients }) => result(await pollRecipients(env, limit, recipients)));
+  server.registerTool("weixin_poll", { description: "读取微信消息。收到 weixin.message.received 时必须传 messageRefs 原值，原子领取并避免重复处理；空 messages 静默。省略 messageRefs 保留旧按需拉取接口。", inputSchema: { messageRefs: z.array(z.string().min(3).max(180)).min(1).max(100).optional(), limit: z.number().int().min(1).max(100).optional().default(20), recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional() } }, async ({ limit, recipients, messageRefs }) => result(messageRefs ? await claimByRefs(env,messageRefs) : await pollRecipients(env, limit, recipients)));
   server.registerTool("weixin_media_get", { description: "读取 weixin_poll 返回的 mediaRef。图片/常见音频以内嵌 MCP 多模态内容返回，其他文件作为二进制 resource。", inputSchema: { mediaRef: z.string().min(3).max(220) } }, async ({ mediaRef }) => mediaToolResult(env, mediaRef));
-  server.registerTool("weixin_reply", { description: "回复 weixin_poll 返回的具体微信消息，Worker 自动定位用户和 context_token。", inputSchema: { messageRef: z.string().min(3).max(180), text: z.string().min(1).max(70_000) } }, async ({ messageRef, text }) => result(await replyByRef(env, messageRef, text)));
+  server.registerTool("weixin_reply", { description: "回复 weixin_poll 返回的具体微信消息，Worker 自动定位用户和 context_token；如读取结果有 processingToken，请原样传入。重复回复不会再次发送。", inputSchema: { processingToken: z.string().max(100).optional(), messageRef: z.string().min(3).max(180), text: z.string().min(1).max(70_000) } }, async ({ messageRef, text, processingToken }) => result(await replyByRef(env, messageRef, text, processingToken)));
   return server;
 }
 
@@ -363,6 +377,18 @@ async function handleAdminMedia(env: Env, pathname: string) {
 }
 
 export default {
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    if (!eventsEnabled(env)) return;
+    // Preserve iLink getUpdates upstream ingestion. Only ChatGPT's trigger changes.
+    ctx.waitUntil((async () => {
+      const list = (await profiles(env)).filter(user => user.enabled);
+      await Promise.all(list.map(async user => {
+        try { await callUser(env,user.id,"/poll",{method:"POST",body:JSON.stringify({limit:50,userId:user.id})}); }
+        catch { console.warn({method:"weixin/upstream",authorized:true,reason:"upstream_poll_failed"}); }
+      }));
+      await callRegistry(env,"/events/tick",{method:"POST",body:"{}"});
+    })());
+  },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/") return Response.json({ ok: true, service: "weixin-mcp-worker", version: VERSION, mcp: "/mcp", admin: "/admin", health: "/health" });
@@ -403,6 +429,37 @@ export default {
       try { return Response.json({ ok: true, service: "weixin-mcp-worker", version: VERSION, user: identity.email || identity.sub || "authenticated", weixin: await usersWithStatus(env) }); }
       catch (error) { return Response.json({ ok: false, service: "weixin-mcp-worker", version: VERSION, error: error instanceof Error ? error.message : String(error) }, { status: 503 }); }
     }
-    return createMcpHandler(() => createServer(env), { route: "/mcp", responseMode: "json" })(request, env, ctx);
+    // The pinned SDK supports MCP 2.0, but predates the Events extension.
+    // Keep all existing tool transport handling intact; route the extension's
+    // JSON-RPC methods through the same Access-authenticated endpoint.
+    const rpc = request.method === "POST" ? await request.clone().json().catch(() => null) as JsonObject | null : null;
+    const owner = typeof identity.sub === "string" ? identity.sub : "";
+    if (rpc && ["events/list", "events/subscribe", "events/unsubscribe"].includes(rpc.method)) {
+      if (rpc.jsonrpc !== "2.0" || !(typeof rpc.id === "string" || typeof rpc.id === "number")) {
+        return Response.json({ jsonrpc: "2.0", id: rpc.id ?? null, error: { code: -32600, message: "Invalid Request" } });
+      }
+      let response: Response;
+      let data: JsonObject;
+      try {
+        response = await stubByName(env, REGISTRY_DO).fetch("https://weixin-bot.internal/events/rpc", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ method: rpc.method, owner, params: rpc.params ?? {} }) }) as unknown as Response;
+        data = await response.json() as JsonObject;
+      } catch {
+        console.warn(eventDiagnostic(rpc.method, rpc.params, false, null, eventsEnabled(env), authorized(owner, env)));
+        return Response.json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32603, message: "internal_error" } }, { headers: { "cache-control": "no-store" } });
+      }
+      const diagnostic = eventDiagnostic(rpc.method, rpc.params, response.ok, data, eventsEnabled(env), authorized(owner, env));
+      if (response.ok) console.info(diagnostic); else console.warn(diagnostic);
+      return Response.json(response.ok ? { jsonrpc: "2.0", id: rpc.id, result: { ...data, resultType: "complete" } } : { jsonrpc: "2.0", id: rpc.id, error: { code: data.code || -32603, message: data.reason || "Event operation failed", data: { reason: data.reason || "internal_error", ...data.details } } }, { headers: { "cache-control": "no-store" } });
+    }
+    const response = await createMcpHandler(() => createServer(env), { route: "/mcp", responseMode: "json" })(request, env, ctx);
+    if (rpc?.method === "server/discover" && authorized(owner, env) && response.ok && response.headers.get("content-type")?.includes("application/json")) {
+      const data = await response.clone().json() as JsonObject;
+      if (data.result?.capabilities && data.result.supportedVersions?.includes("2026-07-28")) {
+        data.result.capabilities.events = {};
+        const headers = new Headers(response.headers); headers.delete("content-length");
+        return Response.json(data, { status: response.status, headers });
+      }
+    }
+    return response;
   },
 };

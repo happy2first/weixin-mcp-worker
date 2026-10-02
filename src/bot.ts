@@ -1,3 +1,5 @@
+import { WeixinEvents, EventError, eventsEnabled } from "./events.js";
+import { claimMessages, beginReply } from "./message-processing.js";
 import { Buffer } from "node:buffer";
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -187,6 +189,7 @@ function binaryFromSql(value: unknown): Uint8Array {
 export class WeixinBotDO extends DurableObject<Env> {
   private pollInFlight?: Promise<PollResult>;
   private lastStorageAlertAt = 0;
+  private events = new WeixinEvents(this.ctx, this.env);
 
   private ensureSchema() {
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS messages (
@@ -207,6 +210,8 @@ export class WeixinBotDO extends DurableObject<Env> {
     )`);
     this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC)");
     this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_pending ON messages(direction,status,created_at)");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS message_processing(message_ref TEXT PRIMARY KEY,token TEXT NOT NULL,lease_until INTEGER NOT NULL,reply_state TEXT NOT NULL)");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS message_event_outbox(message_ref TEXT PRIMARY KEY,ready INTEGER NOT NULL DEFAULT 0,emitted INTEGER NOT NULL DEFAULT 0)");
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS media_objects (
       media_ref TEXT PRIMARY KEY,
       message_ref TEXT NOT NULL,
@@ -632,13 +637,14 @@ export class WeixinBotDO extends DurableObject<Env> {
 
   private pendingMessages(limit: number): PublicMessageRecord[] {
     this.ensureSchema();
-    return this.ctx.storage.sql.exec<MessageRow>("SELECT * FROM messages WHERE direction='inbound' AND status='pending' ORDER BY created_at ASC LIMIT ?",limit).toArray().map(publicRow);
+    return this.ctx.storage.sql.exec<MessageRow>("SELECT * FROM messages m WHERE direction='inbound' AND status='pending' AND NOT EXISTS(SELECT 1 FROM message_processing p WHERE p.message_ref=m.message_ref AND (p.lease_until>? OR p.reply_state IN ('sending','uncertain','done'))) ORDER BY created_at ASC LIMIT ?",Date.now(),limit).toArray().map(publicRow);
   }
 
   private async performPoll(limit: number, runRetention = true): Promise<PollResult> {
     const account = await this.account();
     if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先在 /admin 完成扫码绑定");
     this.ensureSchema();
+    this.ctx.waitUntil(this.flushMessageEvents());
     const sync = await this.syncState();
     const now = new Date().toISOString();
     try {
@@ -655,15 +661,23 @@ export class WeixinBotDO extends DurableObject<Env> {
           if (!message.from_user_id || message.from_user_id !== account.userId) { ignored += 1; continue; }
           const id=sourceId(message);
           const existing=this.ctx.storage.sql.exec<{ message_ref:string }>("SELECT message_ref FROM messages WHERE source_id=? LIMIT 1",id).toArray()[0];
-          if (existing) continue;
+          if (existing) {
+            // A crash while persisting media must not suppress the durable event.
+            this.ctx.storage.sql.exec("UPDATE message_event_outbox SET ready=1 WHERE message_ref=?", existing.message_ref);
+            continue;
+          }
           const createTimeMs=typeof message.create_time_ms === "number" && Number.isFinite(message.create_time_ms) ? message.create_time_ms : undefined;
           const messageRef=`wxmsg_${crypto.randomUUID().replace(/-/g,"")}`;
           const metadata=safeMediaMetadata(message);
-          this.insertHistory({ message_ref:messageRef,source_id:id,direction:"inbound",kind:messageKind(message),text:messageText(message),status:"pending",context_token:message.context_token || null,from_user_id:message.from_user_id,created_at:createTimeMs ? new Date(createTimeMs).toISOString() : now,replied_at:null,reply_to:null,metadata_json:JSON.stringify(metadata),external_ids_json:null,error:null });
+          this.ctx.storage.transactionSync(() => {
+            this.insertHistory({ message_ref:messageRef,source_id:id,direction:"inbound",kind:messageKind(message),text:messageText(message),status:"pending",context_token:message.context_token || null,from_user_id:message.from_user_id!,created_at:createTimeMs ? new Date(createTimeMs).toISOString() : now,replied_at:null,reply_to:null,metadata_json:JSON.stringify(metadata),external_ids_json:null,error:null });
+            this.ctx.storage.sql.exec("INSERT INTO message_event_outbox(message_ref) VALUES(?)", messageRef);
+          });
           const persisted=await this.persistInboundMedia(messageRef,message);
           if (persisted.media.length) metadata.media=persisted.media;
           if (persisted.errors.length) metadata.mediaErrors=persisted.errors;
           if (persisted.media.length || persisted.errors.length) this.updateMessageMetadata(messageRef,metadata);
+          this.ctx.storage.sql.exec("UPDATE message_event_outbox SET ready=1 WHERE message_ref=?", messageRef);
           received += 1;
           if (message.context_token) account.contextToken=message.context_token;
           account.lastInboundAt=now;
@@ -675,6 +689,7 @@ export class WeixinBotDO extends DurableObject<Env> {
     } catch (error) {
       sync.lastPollAt=now;sync.lastPollError=errorMessage(error);await this.ctx.storage.put(SYNC_KEY,sync);throw error;
     }
+    this.ctx.waitUntil(this.flushMessageEvents());
     if (runRetention) await this.safeEnforceRetention();
     const pending=this.pendingMessages(limit);
     const count=this.ctx.storage.sql.exec<{ count:number }>("SELECT COUNT(*) AS count FROM messages WHERE direction='inbound' AND status='pending'").toArray()[0];
@@ -686,7 +701,7 @@ export class WeixinBotDO extends DurableObject<Env> {
     return this.pollInFlight;
   }
 
-  private async reply(messageRef: string,text: string) {
+  private async reply(messageRef: string,text: string,processingToken?: string) {
     const account=await this.account();
     if (!account?.token || !account.userId) throw new Error("尚未绑定微信 ClawBot，请先在 /admin 完成扫码绑定");
     this.ensureSchema();
@@ -701,6 +716,7 @@ export class WeixinBotDO extends DurableObject<Env> {
     const messageIds:string[]=[];
     let replyContext=row.context_token || account.contextToken;
     await this.safeEnforceRetention();
+    beginReply(this.ctx, messageRef, processingToken);
     try {
       for (let i=0;i<chunks.length;i+=1) {
         const sent=await this.sendTextWithRecovery(account,row.from_user_id,chunks[i],replyContext);
@@ -708,12 +724,16 @@ export class WeixinBotDO extends DurableObject<Env> {
         if (i < chunks.length - 1) await sleep(SEND_CHUNK_DELAY_MS);
       }
     } catch (error) {
+      // Network failure may occur after upstream acceptance. Persist ambiguity;
+      // neither duplicate Events nor the fallback poller may resend blindly.
+      this.ctx.storage.sql.exec("UPDATE message_processing SET reply_state='uncertain',lease_until=0 WHERE message_ref=?", messageRef);
       try { this.ctx.storage.sql.exec("UPDATE messages SET error=? WHERE message_ref=?",errorMessage(error),messageRef); } catch {}
       try { this.insertHistory({ message_ref:outboundRef,source_id:null,direction:"outbound",kind:"text",text,status:"failed",context_token:null,from_user_id:null,created_at:new Date().toISOString(),replied_at:null,reply_to:messageRef,metadata_json:JSON.stringify({ chunks:chunks.length }),external_ids_json:JSON.stringify(messageIds),error:errorMessage(error) }); } catch (historyError) { await this.alertStorageFull(historyError); }
       await this.safeEnforceRetention();
       throw error;
     }
 
+    this.ctx.storage.sql.exec("UPDATE message_processing SET reply_state='done',lease_until=0 WHERE message_ref=?", messageRef);
     const repliedAt=new Date().toISOString();
     let stateWarning:string | null=null;
     try {
@@ -763,6 +783,8 @@ export class WeixinBotDO extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("DELETE FROM media_chunks WHERE media_ref IN (SELECT media_ref FROM media_objects WHERE message_ref=?)",messageRef);
       this.ctx.storage.sql.exec("DELETE FROM media_objects WHERE message_ref=?",messageRef);
+      this.ctx.storage.sql.exec("DELETE FROM message_processing WHERE message_ref=?",messageRef);
+      this.ctx.storage.sql.exec("DELETE FROM message_event_outbox WHERE message_ref=?",messageRef);
       this.ctx.storage.sql.exec("DELETE FROM messages WHERE message_ref=?",messageRef);
     });
     return { success:true,deleted:messageRef };
@@ -770,7 +792,7 @@ export class WeixinBotDO extends DurableObject<Env> {
 
   private clearMessages() {
     this.ensureSchema();
-    this.ctx.storage.transactionSync(() => { this.ctx.storage.sql.exec("DELETE FROM media_chunks");this.ctx.storage.sql.exec("DELETE FROM media_objects");this.ctx.storage.sql.exec("DELETE FROM messages"); });
+    this.ctx.storage.transactionSync(() => { this.ctx.storage.sql.exec("DELETE FROM media_chunks");this.ctx.storage.sql.exec("DELETE FROM media_objects");this.ctx.storage.sql.exec("DELETE FROM messages");this.ctx.storage.sql.exec("DELETE FROM message_processing");this.ctx.storage.sql.exec("DELETE FROM message_event_outbox"); });
     return { success:true };
   }
 
@@ -780,6 +802,27 @@ export class WeixinBotDO extends DurableObject<Env> {
     await clearRetentionState(this.ctx.storage as any);
     this.clearMessages();
     return { success:true };
+  }
+
+  private async flushMessageEvents() {
+    if (!eventsEnabled(this.env)) return;
+    this.ensureSchema();
+    const userId = await this.ctx.storage.get<string>("events.userId");
+    if (!userId) return;
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM message_event_outbox WHERE NOT EXISTS(SELECT 1 FROM messages m WHERE m.message_ref=message_event_outbox.message_ref)");
+    sql.exec("DELETE FROM message_processing WHERE NOT EXISTS(SELECT 1 FROM messages m WHERE m.message_ref=message_processing.message_ref)");
+    const rows = sql.exec<MessageRow>("SELECT m.* FROM messages m JOIN message_event_outbox o ON o.message_ref=m.message_ref WHERE o.ready=1 AND o.emitted=0 ORDER BY m.created_at LIMIT 100").toArray();
+    const registry = this.env.WEIXIN_BOT.get(this.env.WEIXIN_BOT.idFromName("__registry__"));
+    for (const row of rows) {
+      try {
+        const media = parseJson<any>(row.metadata_json, {}).media || [];
+        const response = await registry.fetch("https://internal/events/ingest", { method: "POST", body: JSON.stringify({ messageRef: `${userId}:${row.message_ref}`, mediaRefs: media.map((m: any) => `${userId}:${m.mediaRef}`), timestamp: row.created_at }) });
+        const data = await response.json() as any;
+        if (!response.ok || !data.accepted) break;
+        sql.exec("UPDATE message_event_outbox SET emitted=1 WHERE message_ref=?", row.message_ref);
+      } catch { console.warn({ method: "events/ingest", authorized: true, reason: "internal_error" }); break; }
+    }
   }
 
   async fetch(request:Request):Promise<Response> {
@@ -798,6 +841,20 @@ export class WeixinBotDO extends DurableObject<Env> {
       }
       if (request.method !== "POST") return json({ error:"method_not_allowed" },405);
       const body=await request.json().catch(() => ({})) as Record<string,unknown>;
+      if (url.pathname === "/events/rpc") {
+        try { return json(await this.events.request(String(body.method), String(body.owner || ""), body.params || {})); }
+        catch (error) { const e = error instanceof EventError ? error : new EventError(-32603,"internal_error"); return json({ code:e.code,reason:e.reason,details:e.details },400); }
+      }
+      if (url.pathname === "/events/ingest") {
+        const accepted = await this.events.enqueue(String(body.messageRef), body.mediaRefs as string[], String(body.timestamp));
+        this.ctx.waitUntil(this.events.tick()); return json({ accepted });
+      }
+      if (url.pathname === "/events/tick") { await this.events.tick(); return json({ ok:true }); }
+      if (url.pathname === "/messages/claim") {
+        this.ensureSchema();
+        const claimed = claimMessages(this.ctx, body.messageRefs as string[]);
+        return json({ success:true, ...claimed, messages:claimed.messages.map(publicRow) });
+      }
       if (url.pathname === "/registry/create") return json(await this.registryCreate(body));
       if (url.pathname === "/registry/update") return json(await this.registryUpdate(body));
       if (url.pathname === "/registry/remove") return json(await this.registryRemove(body));
@@ -806,8 +863,13 @@ export class WeixinBotDO extends DurableObject<Env> {
       if (url.pathname === "/login/status") { const sessionId=String(body.sessionId || "").trim();if (!sessionId) throw new Error("缺少 sessionId");return json(await this.pollLogin(sessionId,typeof body.verifyCode === "string" ? body.verifyCode : undefined)); }
       if (url.pathname === "/send") return json(await this.send(String(body.text || "")));
       if (url.pathname === "/send-media") return json(await this.sendMedia(body));
-      if (url.pathname === "/poll") { const requested=Number(body.limit || 20);const limit=Number.isFinite(requested) ? Math.min(50,Math.max(1,Math.trunc(requested))) : 20;return json(await this.poll(limit)); }
-      if (url.pathname === "/reply") { const messageRef=String(body.messageRef || "").trim();if (!messageRef) throw new Error("缺少 messageRef");return json(await this.reply(messageRef,String(body.text || ""))); }
+      if (url.pathname === "/poll") { if (typeof body.userId === "string") await this.ctx.storage.put("events.userId",normalizeProfileId(body.userId)); const requested=Number(body.limit || 20);const limit=Number.isFinite(requested) ? Math.min(50,Math.max(1,Math.trunc(requested))) : 20;const polled=await this.poll(limit);
+        if (body.claim === true) {
+          const claimed=claimMessages(this.ctx,polled.messages.map(m=>m.messageRef));
+          return json({...polled,messages:claimed.messages.map(row=>({...publicRow(row),processingToken:claimed.processingToken}))});
+        }
+        return json(polled); }
+      if (url.pathname === "/reply") { const messageRef=String(body.messageRef || "").trim();if (!messageRef) throw new Error("缺少 messageRef");return json(await this.reply(messageRef,String(body.text || ""),typeof body.processingToken === "string" ? body.processingToken : undefined)); }
       if (url.pathname === "/messages/delete") return json(this.deleteMessage(String(body.messageRef || "").trim()));
       if (url.pathname === "/messages/clear") return json(this.clearMessages());
       if (url.pathname === "/reset") return json(await this.reset());

@@ -147,6 +147,7 @@ function requestHeadersWithoutBodyLength(request: Request) {
 }
 
 export default {
+  scheduled: worker.scheduled,
   async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname !== "/mcp" || request.method !== "POST") return worker.fetch(request, env, ctx);
