@@ -7,7 +7,7 @@ export function claimMessages(ctx: DurableObjectState, refs: string[]) {
       if (!row) continue;
       const lease = sql.exec<any>("SELECT * FROM message_processing WHERE message_ref=?", ref).toArray()[0];
       if (lease?.lease_until > now || lease?.reply_state === "sending" || lease?.reply_state === "uncertain" || lease?.reply_state === "done") continue;
-      sql.exec("INSERT INTO message_processing(message_ref,token,lease_until,reply_state) VALUES(?,?,?,'idle') ON CONFLICT(message_ref) DO UPDATE SET token=excluded.token,lease_until=excluded.lease_until", ref, token, now + 600_000);
+      sql.exec("INSERT INTO message_processing(message_ref,token,lease_until,reply_state) VALUES(?,?,?,'idle') ON CONFLICT(message_ref) DO UPDATE SET lease_until=excluded.lease_until,token=excluded.token", ref, token, now + 600_000);
       messages.push(row);
     }
   });
