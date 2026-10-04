@@ -26,6 +26,12 @@ export interface WeixinAccountState {
   baseUrl: string;
   boundAt: string;
   contextToken?: string;
+  contextVersion?: string;
+  contextState?: "missing" | "unknown" | "available" | "invalid";
+  contextUpdatedAt?: string;
+  contextVerifiedAt?: string;
+  contextInvalidAt?: string;
+  contextInvalidReason?: string;
   lastInboundAt?: string;
   lastNotifyStartAt?: string;
   lastNotifyStartError?: string;

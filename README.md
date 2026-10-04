@@ -290,3 +290,11 @@ npm run deploy
 ## MCP Events（0.6.0）
 
 新增 `weixin.message.received`，复用 Access JWT 的 sub 管理订阅，默认开启，事件只含 messageRef/mediaRefs。使用 Secret `EVENTS_ENCRYPTION_KEY`；默认精确允许 connectors.api.openai.com。失败持续退避重试，含 410，不自动删除长期订阅。保留原微信 getUpdates/读取/媒体和回复路径，每分钟 Worker Cron 收消息并推事件。详见 [部署、事件处理与验收/恢复说明](docs/mcp-events.md)。必须完成真实微信全链路和重复事件验收后，才能停用原 ChatGPT 小时轮询。
+
+## 会话状态说明
+
+`weixin_status` 中的 `connected` 仅表示本地已保存绑定凭证，`hasContextToken` 仅表示本地保存了上下文 token；均不保证微信当前接受发送。
+
+请读取 `contextState`：`missing`（无上下文）、`unknown`（旧数据尚未验证）、`available`（最近收到上下文或发送成功）、`invalid`（微信返回 `ret=-2`，需给 ClawBot 发消息刷新）。结合 `contextUpdatedAt`、`contextVerifiedAt`、`contextInvalidAt` 判断证据时间。`available` 不保证实时有效，当前没有独立的有效性查询或可靠的固定有效期。状态查询不会发送测试消息。
+
+明确的上下文拒绝会持久化失效状态；空轮询不会清除失效标记，网络错误不会误判为上下文失效。新入站上下文可刷新状态，旧请求的结果不会覆盖较新的上下文版本。文本、媒体、回复及内部提醒共用此逻辑。

@@ -244,13 +244,10 @@ export class WeixinBotDO extends DurableObject<Env> {
     try {
       const account = await this.account();
       if (!account?.token || !account.userId) return;
-      try {
-        await sendTextMessage(this.env, { baseUrl: account.baseUrl, token: account.token, toUserId: account.userId, text, contextToken: account.contextToken });
-      } catch (error) {
-        if (error instanceof WeixinSendError && error.ret === -2) {
-          await sendTextMessage(this.env, { baseUrl: account.baseUrl, token: account.token, toUserId: account.userId, text });
-        } else throw error;
-      }
+      // Retention alerts can run inside polling; do not await the same poll recursively.
+      await this.sendWithContextRecovery(account, account.contextToken, (contextToken) => sendTextMessage(this.env, {
+        baseUrl: account.baseUrl, token: account.token, toUserId: account.userId, text, contextToken,
+      }), false);
     } catch (error) {
       console.error("WeixinBotDO alert failed:", errorMessage(error));
     }
@@ -278,44 +275,91 @@ export class WeixinBotDO extends DurableObject<Env> {
     }
   }
 
+  // Serialize short state updates only; never hold the gate during upstream I/O.
+  private async updateAccount(snapshot: WeixinAccountState, update: (current: WeixinAccountState) => void) {
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const current = await this.account();
+      if (!current || current.token !== snapshot.token || current.userId !== snapshot.userId || current.boundAt !== snapshot.boundAt) return;
+      update(current);
+      await this.ctx.storage.put(ACCOUNT_KEY, current);
+    });
+  }
+
+  private async recordContextResult(snapshot: WeixinAccountState, token: string | undefined, valid: boolean) {
+    await this.updateAccount(snapshot, (current) => {
+      // A result for a historical token or an older generation cannot replace new inbound state.
+      if (current.contextVersion !== snapshot.contextVersion || current.contextToken !== token) return;
+      const now = new Date().toISOString();
+      if (valid) {
+        current.contextState = token ? "available" : "missing";
+        current.contextVerifiedAt = now;
+        delete current.contextInvalidAt;
+        delete current.contextInvalidReason;
+      } else {
+        current.contextState = "invalid";
+        current.contextInvalidAt = now;
+        current.contextInvalidReason = "upstream_ret_minus_2";
+      }
+    });
+  }
+
   private async sendWithContextRecovery<T>(
     account: WeixinAccountState,
     preferredContextToken: string | undefined,
     sender: (contextToken?: string) => Promise<T>,
+    refreshPoll = true,
   ): Promise<{ value: T; contextToken?: string; recovery: "none" | "refreshed" | "without_context" }> {
     const initial = preferredContextToken || account.contextToken;
     try {
-      return { value: await sender(initial), contextToken: initial, recovery: "none" };
+      const value = await sender(initial);
+      await this.recordContextResult(account, initial, true);
+      return { value, contextToken: initial, recovery: "none" };
     } catch (error) {
       if (!(error instanceof WeixinSendError) || error.ret !== -2) throw error;
+      await this.recordContextResult(account, initial, false);
     }
 
     try {
-      if (this.pollInFlight) await this.pollInFlight;
-      else await this.performPoll(20, false);
+      if (refreshPoll) {
+        if (this.pollInFlight) await this.pollInFlight;
+        else await this.performPoll(20, false);
+      }
     } catch (error) {
       console.warn("Weixin context refresh poll failed:", errorMessage(error));
     }
 
-    const latest = (await this.account()) || account;
-    if (latest.contextToken && latest.contextToken !== initial) {
+    const latest = await this.account();
+    // Do not send using credentials captured before a reset/rebind.
+    if (!latest || latest.token !== account.token || latest.userId !== account.userId || latest.boundAt !== account.boundAt) {
+      throw new Error("微信绑定已变更，请重试");
+    }
+    if (latest.contextToken && (latest.contextToken !== initial || latest.contextVersion !== account.contextVersion)) {
       try {
         const value = await sender(latest.contextToken);
-        account.contextToken = latest.contextToken;
-        await this.ctx.storage.put(ACCOUNT_KEY, account);
+        await this.recordContextResult(latest, latest.contextToken, true);
+        Object.assign(account, latest);
         return { value, contextToken: latest.contextToken, recovery: "refreshed" };
       } catch (error) {
         if (!(error instanceof WeixinSendError) || error.ret !== -2) throw error;
+        await this.recordContextResult(latest, latest.contextToken, false);
       }
     }
 
     try {
       const value = await sender(undefined);
-      if (account.contextToken === initial) delete account.contextToken;
-      await this.ctx.storage.put(ACCOUNT_KEY, account);
+      await this.updateAccount(latest, (current) => {
+        if (current.contextVersion !== latest.contextVersion || current.contextToken !== latest.contextToken) return;
+        delete current.contextToken;
+        current.contextState = "missing";
+        current.contextVerifiedAt = new Date().toISOString();
+        delete current.contextInvalidAt;
+        delete current.contextInvalidReason;
+      });
+      delete account.contextToken;
       return { value, contextToken: undefined, recovery: "without_context" };
     } catch (error) {
       if (error instanceof WeixinSendError && error.ret === -2) {
+        await this.recordContextResult(latest, latest.contextToken, false);
         throw new Error("微信会话上下文已失效。请先在微信里给 ClawBot 发一条消息刷新会话，然后重试。");
       }
       throw error;
@@ -402,7 +446,15 @@ export class WeixinBotDO extends DurableObject<Env> {
       baseUrl: account?.baseUrl || null,
       boundAt: account?.boundAt || null,
       lastInboundAt: account?.lastInboundAt || null,
+      // Legacy fields describe stored credentials, not live upstream health.
       hasContextToken: Boolean(account?.contextToken),
+      contextState: account?.contextState || (account?.contextToken ? "unknown" : "missing"),
+      contextUpdatedAt: account?.contextUpdatedAt || null,
+      contextVerifiedAt: account?.contextVerifiedAt || null,
+      contextInvalidAt: account?.contextInvalidAt || null,
+      contextInvalidReason: account?.contextInvalidReason || null,
+      contextNeedsRefresh: account?.contextState === "invalid" || !account?.contextToken,
+      contextMessage: account?.contextState === "invalid" ? "微信会话上下文已失效，请在微信里给 ClawBot 发一条消息刷新会话" : null,
       messageCount: Number(counts?.total || 0),
       pendingInbound: Number(counts?.pending || 0),
       mediaCount: media.count,
@@ -656,6 +708,7 @@ export class WeixinBotDO extends DurableObject<Env> {
         const isApiError = (response.ret !== undefined && response.ret !== 0) || (response.errcode !== undefined && response.errcode !== 0);
         if (isApiError) throw new Error(`微信 getUpdates 失败：ret=${response.ret ?? 0}, errcode=${response.errcode ?? 0}, errmsg=${response.errmsg || "unknown"}`);
         let received=0,ignored=0;
+        let inboundContext: string | undefined;
         for (const message of response.msgs || []) {
           if (message.message_type !== undefined && message.message_type !== 1) { ignored += 1; continue; }
           if (!message.from_user_id || message.from_user_id !== account.userId) { ignored += 1; continue; }
@@ -679,12 +732,24 @@ export class WeixinBotDO extends DurableObject<Env> {
           if (persisted.media.length || persisted.errors.length) this.updateMessageMetadata(messageRef,metadata);
           this.ctx.storage.sql.exec("UPDATE message_event_outbox SET ready=1 WHERE message_ref=?", messageRef);
           received += 1;
-          if (message.context_token) account.contextToken=message.context_token;
+          if (message.context_token) inboundContext=message.context_token;
           account.lastInboundAt=now;
         }
         if (response.get_updates_buf) sync.getUpdatesBuf=response.get_updates_buf;
         sync.lastPollAt=now;sync.lastPollTimedOut=false;sync.lastPollReceived=received;sync.lastPollIgnored=ignored;sync.lastPollError=undefined;
-        await this.ctx.storage.put({ [ACCOUNT_KEY]:account,[SYNC_KEY]:sync });
+        await this.updateAccount(account, (current) => {
+          if (received) current.lastInboundAt = now;
+          if (inboundContext) {
+            current.contextToken = inboundContext;
+            current.contextVersion = crypto.randomUUID();
+            current.contextState = "available";
+            current.contextUpdatedAt = now;
+            delete current.contextVerifiedAt;
+            delete current.contextInvalidAt;
+            delete current.contextInvalidReason;
+          }
+        });
+        await this.ctx.storage.put(SYNC_KEY,sync);
       }
     } catch (error) {
       sync.lastPollAt=now;sync.lastPollError=errorMessage(error);await this.ctx.storage.put(SYNC_KEY,sync);throw error;
@@ -748,8 +813,6 @@ export class WeixinBotDO extends DurableObject<Env> {
       }
     }
     const historyWarning=await this.persistDeliveredHistory({ message_ref:outboundRef,source_id:null,direction:"outbound",kind:"text",text,status:"sent",context_token:null,from_user_id:null,created_at:repliedAt,replied_at:null,reply_to:messageRef,metadata_json:JSON.stringify({ chunks:chunks.length }),external_ids_json:JSON.stringify(messageIds),error:null });
-    if (replyContext) account.contextToken=replyContext; else delete account.contextToken;
-    try { await this.ctx.storage.put(ACCOUNT_KEY,account); } catch (accountError) { stateWarning=stateWarning || errorMessage(accountError); }
     const cleanup=await this.safeEnforceRetention();
     return { success:true,alreadyReplied:false,messageRef,outboundMessageRef:outboundRef,chunks:chunks.length,messageIds,repliedAt,historyWarning,stateWarning,cleanup };
   }
