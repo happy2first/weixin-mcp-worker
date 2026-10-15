@@ -3,7 +3,7 @@ import { eventDiagnostic } from "./events-diagnostics.js";
 import { Buffer } from "node:buffer";
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import QRCode from "qrcode";
 import { z } from "zod";
 import { ADMIN_PAGE } from "./admin-page.js";
@@ -276,8 +276,34 @@ async function mediaToolResult(env: Env, globalMediaRef: string) {
   return { content: [meta, { type: "resource", resource: { uri: `weixin-media://${encodeURIComponent(globalMediaRef)}`, mimeType, blob: data } }] as any };
 }
 
-function createServer(env: Env) {
+// This server and its identity closure belong to ONE verified HTTP request.
+function createServer(env: Env, identity: Readonly<JWTPayload>) {
   const server = new McpServer({ name: "weixin-mcp-worker", version: VERSION });
+  server.registerTool("get_profile", {
+    description: "Return the profile represented by this request's verified Access credentials. The opaque ID remains stable across token refresh, reconnection and display-metadata changes.",
+    inputSchema: z.strictObject({}),
+    outputSchema: z.strictObject({
+      id: z.string().min(1).regex(/\S/).describe("Opaque profile identifier, unique within this app and unchanged across token refresh, reconnection and display-metadata changes. Never reassigned to another profile."),
+      name: z.string().optional().describe("Display name for the authenticated profile."),
+      email: z.string().optional().describe("Email address for display; not used as the profile identity."),
+      nickname: z.string().optional().describe("A useful label that helps users distinguish connected profiles."),
+    }),
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    _meta: { "openai/profile": true },
+  }, async () => {
+    if (typeof identity.sub !== "string" || !identity.sub.trim()) {
+      return { isError: true, content: [{ type: "text", text: "access_denied: Valid Access subject required for profile identity." }] };
+    }
+    // Freeze this namespace/algorithm: changing it would change existing profile IDs.
+    // Hash the exact subject, never a token, email, grant or Weixin user alias.
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(["weixin-mcp-worker:profile:v1", identity.sub])));
+    const profile = {
+      id: `prf_${Buffer.from(digest).toString("hex")}`,
+      ...(typeof identity.name === "string" && identity.name.trim() ? { name: identity.name } : {}),
+      ...(typeof identity.email === "string" && identity.email.trim() ? { email: identity.email } : {}),
+    };
+    return { isError: false, structuredContent: profile, content: [{ type: "text", text: JSON.stringify(profile) }] };
+  });
   server.registerTool("weixin_users", { description: "列出 /admin 中维护的微信用户、默认用户、绑定状态和存储计划。", inputSchema: {} }, async () => result(await usersWithStatus(env)));
   server.registerTool("weixin_status", { description: "检查微信 MCP 的多用户绑定、消息、历史存储、自动清理和最近轮询状态。connected 和 hasContextToken 仅表示本地凭证存在；请用 contextState 判断最近已知会话状态，available 不保证实时有效。不会返回凭证。", inputSchema: {} }, async () => result(await usersWithStatus(env)));
   server.registerTool("weixin_send", { description: "发送文本给一个或多个已配置微信用户。省略 recipients 时发送给默认用户。", inputSchema: { recipients: z.array(z.string().min(1).max(32)).min(1).max(10).optional(), text: z.string().min(1).max(70_000) } }, async ({ recipients, text }) => result(await sendToRecipients(env, text, recipients)));
@@ -451,7 +477,7 @@ export default {
       if (response.ok) console.info(diagnostic); else console.warn(diagnostic);
       return Response.json(response.ok ? { jsonrpc: "2.0", id: rpc.id, result: { ...data, resultType: "complete" } } : { jsonrpc: "2.0", id: rpc.id, error: { code: data.code || -32603, message: data.reason || "Event operation failed", data: { reason: data.reason || "internal_error", ...data.details } } }, { headers: { "cache-control": "no-store" } });
     }
-    const response = await createMcpHandler(() => createServer(env), { route: "/mcp", responseMode: "json" })(request, env, ctx);
+    const response = await createMcpHandler(() => createServer(env, identity), { route: "/mcp", responseMode: "json" })(request, env, ctx);
     if (rpc?.method === "server/discover" && authorized(owner, env) && response.ok && response.headers.get("content-type")?.includes("application/json")) {
       const data = await response.clone().json() as JsonObject;
       if (data.result?.capabilities && data.result.supportedVersions?.includes("2026-07-28")) {

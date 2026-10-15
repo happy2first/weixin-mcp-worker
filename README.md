@@ -24,6 +24,21 @@
 - 使用 SQLite-backed Durable Objects 保存凭证、游标、消息和媒体；
 - 实验性支持图片、文件和视频的收发。
 
+## MCP Profile Tool（重复连接实验）
+
+`get_profile` 是无参数、只读的认证身份工具，按 [OpenAI Profile Tool 规范](https://developers.openai.com/plugins/build/auth#support-multiple-accounts) 声明 `outputSchema`、只读 annotations 和 `_meta["openai/profile"]: true`。返回顶层 `structuredContent`，并附相同 JSON 文本供兼容客户端使用。
+
+Profile 对应当前请求已验证的 Cloudflare Access 身份，不是 `/admin` 中的微信用户别名。ID 为 `prf_` 加 SHA-256（固定命名空间 `weixin-mcp-worker:profile:v1` 与原始 `identity.sub` 的 JSON 数组），不依赖 Token、会话、邮箱、姓名或微信凭证。同一 `sub` 在刷新 Token、重新授权和不同对话中 ID 一致；不同 `sub` 的 ID 不同。缺少或空白 `sub` 返回认证错误，不提供兜底 ID。仅在验证后的 JWT 有相应信息时返回 `name`、`email`。无需新增配置、数据库或依赖；后续不要修改 ID 派生规则，也不要将旧 Access subject 分配给其他身份。
+
+ChatGPT 验证步骤：
+
+1. 部署完成后刷新插件工具定义，确认 `tools/list` 中存在 `get_profile` 及上述元数据。先记录现有连接数量和 `get_profile` 的 `id`，无需先删除旧连接。
+2. 在不同新对话中调用 `get_profile`；使用同一个 Access 身份，确认 ID 一致。
+3. 使用同一 Access 身份重新授权，再次调用并比较 ID；记录连接账户列表是否新增重复项、显示名称是否正确。可等待正常 Token 刷新后重复检查。
+4. 如有第二个被 Access 允许的身份，可验证它返回不同 ID。不要为了测试更改原有访问策略或 Events 订阅。
+
+此工具为 ChatGPT 提供稳定的账户识别依据，不保证客户端自动合并或删除历史重复连接。若 ID 一致仍出现新增重复项，应继续检查客户端连接记录及 OAuth 流程；本次改动不改变 Managed OAuth、微信收发、Events 或管理页面。自动化测试通过真实 Worker 入口覆盖工具元数据、并发身份隔离、重新签发 Token、显示字段变化和未授权拒绝。
+
 ## 架构
 
 ```text

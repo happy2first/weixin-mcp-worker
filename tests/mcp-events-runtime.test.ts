@@ -37,8 +37,8 @@ test('workerd: real entrypoint JWT, discovery, upstream ingestion, media refs, a
   }
   throw Error('unexpected outbound host');
  }});
- const rpc=async(method:string,params:any={})=>{
-  const r=await mf.dispatchFetch('https://worker/mcp',{method:'POST',headers:{'content-type':'application/json',accept:'application/json','cf-access-jwt-assertion':token,'Mcp-Method':method,'MCP-Protocol-Version':'2026-07-28',...(method==='tools/call'?{'Mcp-Name':params.name}:{})},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params:{...params,_meta:{'io.modelcontextprotocol/protocolVersion':'2026-07-28','io.modelcontextprotocol/clientInfo':{name:'test',version:'1'},'io.modelcontextprotocol/clientCapabilities':{}}}})});
+ const rpc=async(method:string,params:any={},credential=token)=>{
+  const r=await mf.dispatchFetch('https://worker/mcp',{method:'POST',headers:{'content-type':'application/json',accept:'application/json','cf-access-jwt-assertion':credential,'Mcp-Method':method,'MCP-Protocol-Version':'2026-07-28',...(method==='tools/call'?{'Mcp-Name':params.name}:{})},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params:{...params,_meta:{'io.modelcontextprotocol/protocolVersion':'2026-07-28','io.modelcontextprotocol/clientInfo':{name:'test',version:'1'},'io.modelcontextprotocol/clientCapabilities':{}}}})});
   const text=await r.text();assert.equal(r.status,200,text);return JSON.parse(text);
  };
  const tool=async(name:string,args:any={})=>{const r=await rpc('tools/call',{name,arguments:args});assert.ok(!r.result.isError,JSON.stringify(r));return r.result};
@@ -48,6 +48,53 @@ test('workerd: real entrypoint JWT, discovery, upstream ingestion, media refs, a
   const d=await rpc('server/discover');assert.ok(d.result.supportedVersions.includes('2026-07-28'));assert.deepEqual(d.result.capabilities.events,{});
   const list=await rpc('events/list');assert.equal(list.result.events[0].name,'weixin.message.received');
   const tools=await rpc('tools/list');assert.ok(tools.result.tools.find((t:any)=>t.name==='weixin_poll').inputSchema.properties.messageRefs);
+  // Exercise SDK metadata and output validation through the actual deployed entrypoint.
+  const profileTool=tools.result.tools.find((t:any)=>t.name==='get_profile');
+  assert.ok(profileTool);
+  assert.deepEqual(profileTool.inputSchema.properties,{});
+  assert.equal(profileTool.inputSchema.additionalProperties,false);
+  assert.equal(profileTool._meta['openai/profile'],true);
+  assert.deepEqual(profileTool.annotations,{readOnlyHint:true,destructiveHint:false,openWorldHint:false});
+  assert.equal(profileTool.outputSchema.type,'object');
+  assert.deepEqual(profileTool.outputSchema.required,['id']);
+  assert.equal(profileTool.outputSchema.additionalProperties,false);
+  assert.equal(profileTool.outputSchema.properties.id.type,'string');
+  assert.equal(profileTool.outputSchema.properties.id.minLength,1);
+  assert.equal(profileTool.outputSchema.properties.id.pattern,'\\S');
+  for(const key of ['name','email','nickname'])assert.equal(profileTool.outputSchema.properties[key].type,'string');
+  const sign=async(claims:any,subject?:string,expiration='1h')=>{
+   let jwt=new SignJWT(claims).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer('https://test.cloudflareaccess.com').setAudience('test-aud').setExpirationTime(expiration);
+   if(subject!==undefined)jwt=jwt.setSubject(subject);
+   return jwt.sign(privateKey);
+  };
+  const getProfile=async(credential=token)=>{
+   const r=await rpc('tools/call',{name:'get_profile',arguments:{}},credential);
+   assert.ok(!r.error&&!r.result.isError,JSON.stringify(r));
+   assert.deepEqual(JSON.parse(r.result.content[0].text),r.result.structuredContent);
+   return r.result.structuredContent;
+  };
+  const original=await getProfile();
+  assert.match(original.id,/^prf_[a-f0-9]{64}$/);
+  assert.deepEqual(Object.keys(original),['id']);
+  assert.equal((await getProfile()).id,original.id);
+  const renewed=await sign({name:'Owner renamed',email:'new@example.com',jti:'new-grant',token:'never-return-this'},'owner','2h');
+  const other=await sign({name:'Other',email:'other@example.com'},'other');
+  // Concurrent users and fresh server instances must never share identity closures.
+  const [same,different,again]=await Promise.all([getProfile(renewed),getProfile(other),getProfile()]);
+  assert.deepEqual(same,{id:original.id,name:'Owner renamed',email:'new@example.com'});
+  assert.notEqual(different.id,original.id);assert.equal(again.id,original.id);
+  assert.ok(!JSON.stringify(same).includes('never-return-this'));
+  for(const subject of [undefined,'','   ']){
+   const denied=await rpc('tools/call',{name:'get_profile',arguments:{}},await sign({},subject));
+   assert.equal(denied.result.isError,true);assert.equal(denied.result.structuredContent,undefined);
+   assert.match(denied.result.content[0].text,/access_denied/);
+  }
+  const invalidArgs=await rpc('tools/call',{name:'get_profile',arguments:{userId:'other'}});
+  assert.ok(invalidArgs.error||invalidArgs.result.isError);
+  for(const credential of ['not-a-jwt',await sign({},'owner','-1h')]){
+   const denied=await mf.dispatchFetch('https://worker/mcp',{method:'POST',headers:{'content-type':'application/json','cf-access-jwt-assertion':credential},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'get_profile',arguments:{}}})});
+   assert.equal(denied.status,403);assert.equal((await denied.json() as any).error,'access_denied');
+  }
   const params={name:'weixin.message.received',arguments:{},delivery:{mode:'webhook',url:'https://connectors.api.openai.com/private',secret:'whsec_'+Buffer.alloc(32,7).toString('base64')}};
   assert.ok((await rpc('events/subscribe',params)).result.id);
   const namespace=await mf.getDurableObjectNamespace('WEIXIN_BOT');
